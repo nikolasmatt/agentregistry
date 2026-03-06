@@ -3,62 +3,67 @@ templates:
   - validate.yaml
 
 tests:
-  # ── Default — no errors ──────────────────────────────────────────────────────
+  # ── JWT key validation ───────────────────────────────────────────────────────
 
-  - it: renders nothing and produces no errors with default values
+  - it: renders nothing when jwtPrivateKey and database.password are set
+    set:
+      config.jwtPrivateKey: deadbeef1234567890abcdef
+      database.password: changeme
     asserts:
       - hasDocuments:
           count: 0
 
-  - it: renders nothing with bundled database enabled (default)
+  - it: renders nothing when config.existingSecret is set
     set:
-      database.bundled.enabled: true
+      config.existingSecret: my-existing-secret
+      database.password: changeme
     asserts:
       - hasDocuments:
           count: 0
 
-  - it: renders nothing with external DB when allowExternalEgress is true (default)
+  - it: renders nothing when global.existingSecret is set
     set:
-      database.bundled.enabled: false
-      database.external.host: mydb.example.com
-      networkPolicy.enabled: true
-      networkPolicy.allowExternalEgress: true
+      global.existingSecret: global-secret
     asserts:
       - hasDocuments:
           count: 0
 
-  - it: renders nothing with external DB and extraEgress rule when allowExternalEgress is false
+  - it: fails when jwtPrivateKey is empty and no existingSecret is provided
     set:
-      database.bundled.enabled: false
-      database.external.host: mydb.example.com
-      networkPolicy.enabled: true
-      networkPolicy.allowExternalEgress: false
-      networkPolicy.extraEgress:
-        - ports:
-            - port: 5432
-              protocol: TCP
-    asserts:
-      - hasDocuments:
-          count: 0
-
-  - it: renders nothing when networkPolicy is disabled regardless of egress settings
-    set:
-      database.bundled.enabled: false
-      database.external.host: mydb.example.com
-      networkPolicy.enabled: false
-      networkPolicy.allowExternalEgress: false
-    asserts:
-      - hasDocuments:
-          count: 0
-
-  # ── Hard error: external DB + networkPolicy + no egress route ─────────────────
-
-  - it: fails when networkPolicy blocks egress to external database
-    set:
-      database.bundled.enabled: false
-      database.external.host: mydb.example.com
-      networkPolicy.enabled: true
-      networkPolicy.allowExternalEgress: false
+      database.password: changeme
     asserts:
       - failedTemplate:
           errorPattern: "CHART CONFIGURATION ERROR"
+
+  - it: fails when jwtPrivateKey is not a valid hex string
+    set:
+      config.jwtPrivateKey: "not-hex!!"
+      database.password: changeme
+    asserts:
+      - failedTemplate:
+          errorPattern: "CHART CONFIGURATION ERROR"
+
+  # ── Database password validation ─────────────────────────────────────────────
+
+  - it: fails when database.password is empty and no existingSecret is provided
+    set:
+      config.jwtPrivateKey: deadbeef1234567890abcdef
+    asserts:
+      - failedTemplate:
+          errorPattern: "CHART CONFIGURATION ERROR"
+
+  - it: renders nothing when database.existingSecret is set
+    set:
+      config.jwtPrivateKey: deadbeef1234567890abcdef
+      database.existingSecret: pg-secret
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders nothing when database.url is set
+    set:
+      config.jwtPrivateKey: deadbeef1234567890abcdef
+      database.url: "postgres://user:pass@host:5432/db"
+    asserts:
+      - hasDocuments:
+          count: 0
