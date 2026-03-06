@@ -41,6 +41,14 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-node-
 
+    - name: Set up Helm
+      uses: azure/setup-helm@v4
+      with:
+        version: '3.20'
+
+    - name: Install Helm unittest plugin
+      run: helm plugin install https://github.com/helm-unittest/helm-unittest.git
+
     - name: Run Helm Tests
       run: make test-helm
 
