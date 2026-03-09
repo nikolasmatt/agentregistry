@@ -70,6 +70,7 @@ help:
 	@echo "Helm / Chart targets (chart dir: $(HELM_CHART_DIR)):"
 	@echo "  charts-deps          - Build Helm chart dependencies"
 	@echo "  charts-lint          - Lint the Helm chart (helm lint --strict)"
+	@echo "  charts-render-test   - Render chart templates (smoke test with min required values)"
 	@echo "  charts-package       - Package chart → $(HELM_PACKAGE_DIR)/"
 	@echo "  charts-push          - Package + push chart to OCI registry (requires creds)"
 	@echo "  charts-test          - Run helm-unittest tests (installs plugin if absent)"
@@ -354,6 +355,17 @@ charts-deps: _helm-check
 charts-lint: charts-deps
 	@echo "Linting Helm chart $(HELM_CHART_DIR)..."
 	$(HELM) lint $(HELM_CHART_DIR) --strict
+
+# Render chart templates to stdout (smoke test — catches template errors).
+# Uses minimum required values to pass chart validation.
+.PHONY: charts-render-test
+charts-render-test: charts-deps
+	@echo "Rendering chart templates for $(HELM_CHART_DIR)..."
+	$(HELM) template test-release $(HELM_CHART_DIR) \
+	  --values $(HELM_CHART_DIR)/values.yaml \
+	  --set config.jwtPrivateKey=deadbeef1234567890abcdef12345678 \
+	  --set database.password=ci-password \
+	  --set database.host=postgres.example.com
 
 # Package the chart into $(HELM_PACKAGE_DIR)/.
 .PHONY: charts-package
