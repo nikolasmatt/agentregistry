@@ -26,7 +26,7 @@ LOCALARCH ?= $(shell uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
 ## Helm / Chart settings
 # Override HELM if your helm binary lives elsewhere (e.g. HELM=/usr/local/bin/helm).
 HELM ?= helm
-HELM_CHART_DIR ?= ../charts/agentregistry
+HELM_CHART_DIR ?= ./charts/agentregistry
 HELM_PACKAGE_DIR ?= build/charts
 HELM_REGISTRY ?= ghcr.io
 HELM_REPO ?= agentregistry-dev/agentregistry
@@ -330,7 +330,7 @@ mod-download: ## Run go mod download
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helm / Chart targets
-# All targets operate on HELM_CHART_DIR (default: ../charts/agentregistry).
+# All targets operate on HELM_CHART_DIR (default: ./charts/agentregistry).
 # Override with: make charts-test HELM_CHART_DIR=/path/to/chart
 # ──────────────────────────────────────────────────────────────────────────────
 
