@@ -19,6 +19,7 @@ import (
 	"github.com/agentregistry-dev/agentregistry/internal/cli/agent/tui"
 	agentutils "github.com/agentregistry-dev/agentregistry/internal/cli/agent/utils"
 	"github.com/agentregistry-dev/agentregistry/internal/cli/common/docker"
+	cliUtils "github.com/agentregistry-dev/agentregistry/internal/cli/utils"
 	"github.com/agentregistry-dev/agentregistry/internal/utils"
 	"github.com/agentregistry-dev/agentregistry/pkg/models"
 	"github.com/spf13/cobra"
@@ -39,9 +40,11 @@ arctl agent run dice`,
 }
 
 var buildFlag bool
+var envFlags []string
 
 func init() {
 	RunCmd.Flags().BoolVar(&buildFlag, "build", true, "Build the agent and MCP servers before running")
+	RunCmd.Flags().StringArrayVarP(&envFlags, "env", "e", []string{}, "Environment variables to set when running the agent (KEY=VALUE)")
 }
 
 var providerAPIKeys = map[string]string{
@@ -56,10 +59,15 @@ func runRun(cmd *cobra.Command, args []string) error {
 		return cmd.Help()
 	}
 
+	envMap, err := cliUtils.ParseEnvFlags(envFlags)
+	if err != nil {
+		return err
+	}
+
 	target := args[0]
 	if info, err := os.Stat(target); err == nil && info.IsDir() {
 		fmt.Println("Running agent from local directory:", target)
-		return runFromDirectory(cmd.Context(), target)
+		return runFromDirectory(cmd.Context(), target, envMap)
 	}
 
 	agentModel, err := apiClient.GetAgentByName(target)
@@ -68,14 +76,14 @@ func runRun(cmd *cobra.Command, args []string) error {
 	}
 	manifest := agentModel.Agent.AgentManifest
 	version := agentModel.Agent.Version
-	return runFromManifest(cmd.Context(), &manifest, version, nil)
+	return runFromManifest(cmd.Context(), &manifest, version, nil, envMap)
 }
 
 // runFromDirectory runs an agent from a local project directory. It resolves
 // registry-type MCP servers at runtime, regenerating folders for servers that
 // may have already been created during their initial add-cmd invocation. This
 // redundancy is acceptable but could be optimized in the future.
-func runFromDirectory(ctx context.Context, projectDir string) error {
+func runFromDirectory(ctx context.Context, projectDir string, envMap map[string]string) error {
 	manifest, err := project.LoadManifest(projectDir)
 	if err != nil {
 		return fmt.Errorf("failed to load agent.yaml: %w", err)
@@ -156,7 +164,7 @@ func runFromDirectory(ctx context.Context, projectDir string) error {
 
 	return runFromManifest(ctx, manifest, "", &runContext{
 		workDir: projectDir,
-	})
+	}, envMap)
 }
 
 func skillsDirForAgentConfig(baseDir, agentName, version string) string {
@@ -179,7 +187,8 @@ func hasManifestPrompts(manifest *models.AgentManifest) bool {
 // runFromManifest runs an agent based on a manifest, with optional pre-resolved data.
 // When overrides is non-nil (from runFromDirectory), the working directory is already
 // prepared. Otherwise, this function resolves all runtime dependencies first.
-func runFromManifest(ctx context.Context, manifest *models.AgentManifest, version string, overrides *runContext) error {
+// EnvMap contains --env KEY=VALUE overrides (e.g. API keys) and is used for validation and compose process env.
+func runFromManifest(ctx context.Context, manifest *models.AgentManifest, version string, overrides *runContext, envMap map[string]string) error {
 	if manifest == nil {
 		return fmt.Errorf("agent manifest is required")
 	}
@@ -209,7 +218,7 @@ func runFromManifest(ctx context.Context, manifest *models.AgentManifest, versio
 		return err
 	}
 
-	err = runAgent(ctx, composeData, manifest, workDir, buildFlag, hostPort)
+	err = runAgent(ctx, composeData, manifest, workDir, buildFlag, hostPort, envMap)
 
 	if cleanupWorkDir && workDir != "" {
 		if cleanupErr := os.RemoveAll(workDir); cleanupErr != nil {
@@ -453,13 +462,20 @@ func renderComposeFromManifest(manifest *models.AgentManifest, version string, h
 	return []byte(rendered), nil
 }
 
-func runAgent(ctx context.Context, composeData []byte, manifest *models.AgentManifest, workDir string, shouldBuild bool, hostPort int) error {
-	if err := validateAPIKey(manifest.ModelProvider); err != nil {
+func runAgent(ctx context.Context, composeData []byte, manifest *models.AgentManifest, workDir string, shouldBuild bool, hostPort int, envMap map[string]string) error {
+	if err := validateAPIKey(manifest.ModelProvider, envMap); err != nil {
 		return err
 	}
 
 	composeCmd := docker.ComposeCommand()
 	commonArgs := append(composeCmd[1:], "-f", "-")
+
+	// Env for compose subprocess so ${VAR} in the template resolve from --env and OS env
+	// --env flag env vars take precedence over OS env vars (last duplicated key wins)
+	baseEnv := os.Environ()
+	for k, v := range envMap {
+		baseEnv = append(baseEnv, k+"="+v)
+	}
 
 	upArgs := []string{"up", "-d"}
 	if shouldBuild {
@@ -468,6 +484,7 @@ func runAgent(ctx context.Context, composeData []byte, manifest *models.AgentMan
 	upCmd := exec.CommandContext(ctx, composeCmd[0], append(commonArgs, upArgs...)...)
 	upCmd.Dir = workDir
 	upCmd.Stdin = bytes.NewReader(composeData)
+	upCmd.Env = baseEnv
 	if verbose {
 		upCmd.Stdout = os.Stdout
 		upCmd.Stderr = os.Stderr
@@ -498,6 +515,7 @@ func runAgent(ctx context.Context, composeData []byte, manifest *models.AgentMan
 	downCmd := exec.Command(composeCmd[0], append(commonArgs, "down")...)
 	downCmd.Dir = workDir
 	downCmd.Stdin = bytes.NewReader(composeData)
+	downCmd.Env = baseEnv
 	if verbose {
 		downCmd.Stdout = os.Stdout
 		downCmd.Stderr = os.Stderr
@@ -576,9 +594,13 @@ func launchChat(ctx context.Context, agentName string, agentURL string) error {
 	return tui.RunChat(agentName, sessionID, sendFn, verbose)
 }
 
-func validateAPIKey(modelProvider string) error {
+func validateAPIKey(modelProvider string, extraEnv map[string]string) error {
 	envVar, ok := providerAPIKeys[strings.ToLower(modelProvider)]
 	if !ok || envVar == "" {
+		return nil
+	}
+	// Check extra env map first (e.g. from --env flags)
+	if v, exists := extraEnv[envVar]; exists && v != "" {
 		return nil
 	}
 	if os.Getenv(envVar) == "" {
