@@ -60,13 +60,18 @@ help:
 	@echo "  build-cli             - Build the Go CLI"
 	@echo "  build                 - Build both UI and Go CLI"
 	@echo "  install               - Install the CLI to GOPATH/bin"
-	@echo "  run                   - Start local dev environment (docker-compose)"
+	@echo "  run                   - Start local dev environment with Kind (alias: run-k8s)"
+	@echo "  run-docker            - Start local dev environment (docker only, no Kind)"
+	@echo "  run-k8s               - Start local dev environment with Kind cluster"
 	@echo "  down                  - Stop local dev environment"
 	@echo "  dev-ui                - Run Next.js in development mode"
 	@echo "  test                  - Run Go unit tests"
 	@echo "  test-integration      - Run Go tests with integration tests"
 	@echo "  test-coverage         - Run Go tests with coverage"
 	@echo "  test-coverage-report  - Run Go tests with HTML coverage report"
+	@echo "  e2e                   - Run e2e tests against k8s backend (alias: e2e-k8s)"
+	@echo "  e2e-docker            - Run e2e tests against docker backend (no Kind)"
+	@echo "  e2e-k8s               - Run e2e tests against k8s backend (full Kind setup)"
 	@echo "  clean                 - Clean all build artifacts"
 	@echo "  all                   - Clean and build everything"
 	@echo "  lint                  - Run the linter (GOLANGCI_LINT_ARGS=--fix to auto-fix)"
@@ -84,13 +89,13 @@ help:
 	@echo ""
 	@echo "Kind / local K8s targets (cluster: $(KIND_CLUSTER_NAME)):"
 	@echo "  create-kind-cluster   - Create Kind cluster with MetalLB"
-	@echo "  use-kind-cluster      - Merge kubeconfig and set default namespace"
 	@echo "  delete-kind-cluster   - Delete the Kind cluster"
 	@echo "  prune-kind-cluster    - Prune dangling images from Kind control-plane"
 	@echo "  kind-debug            - Shell into Kind control-plane with btop"
 	@echo "  install-postgresql    - Deploy PostgreSQL/pgvector into Kind"
 	@echo "  install-agentregistry - Build images and Helm-install AgentRegistry into Kind"
-	@echo "  setup-kind-cluster    - Full local K8s dev setup (kind + postgres + agentregistry)"
+	@echo "  install-kagent        - Install kagent on the Kind cluster"
+	@echo "  setup-kind-cluster    - Full local K8s dev setup (kind + postgres + agentregistry + kagent)"
 
 # Install UI dependencies
 .PHONY: install-ui
@@ -157,16 +162,31 @@ dev-ui:
 	@echo "Starting Next.js development server..."
 	cd ui && npm run dev
 
-# Start local development environment (docker-compose)
-.PHONY: run
-run: docker-registry docker-compose-up build-cli
+# Start local development environment (docker-compose only, no Kind)
+.PHONY: run-docker
+run-docker: docker-registry docker-compose-up build-cli
 	@echo ""
-	@echo "agentregistry is running:"
+	@echo "agentregistry is running (docker backend):"
 	@echo "  UI:  http://localhost:12121"
 	@echo "  API: http://localhost:12121/v0"
 	@echo "  CLI: ./bin/arctl"
 	@echo ""
 	@echo "To stop: make down"
+
+# Start local development environment with Kind cluster
+.PHONY: run-k8s
+run-k8s: docker-registry create-kind-cluster docker-compose-up build-cli
+	@echo ""
+	@echo "agentregistry is running (k8s backend):"
+	@echo "  UI:  http://localhost:12121"
+	@echo "  API: http://localhost:12121/v0"
+	@echo "  CLI: ./bin/arctl"
+	@echo ""
+	@echo "To stop: make down"
+
+# Start local development environment (default: k8s)
+.PHONY: run
+run: run-k8s
 
 # Stop local development environment
 .PHONY: down
@@ -185,8 +205,21 @@ test:
 	@echo "Running Go tests with integration..."
 	go tool gotestsum --format testdox -- -tags=integration -timeout 10m ./...
 
-e2e: build-cli
-	go tool gotestsum --format testdox -- -tags=e2e -timeout 45m ./e2e/...
+# Run e2e tests against docker backend (skips Kind cluster setup and k8s tests)
+.PHONY: e2e-docker
+e2e-docker: docker-registry docker-compose-up build-cli
+	ARCTL_API_BASE_URL=http://localhost:12121/v0 E2E_BACKEND=docker \
+	  go tool gotestsum --format testdox -- -tags=e2e -timeout 45m ./e2e/...
+
+# Run e2e tests against k8s backend (full Kind cluster setup)
+.PHONY: e2e-k8s
+e2e-k8s: setup-kind-cluster docker-compose-up build-cli
+	ARCTL_API_BASE_URL=http://localhost:12121/v0 KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) E2E_BACKEND=k8s \
+	  go tool gotestsum --format testdox -- -tags=e2e -timeout 45m ./e2e/...
+
+# Run e2e tests (default: k8s)
+.PHONY: e2e
+e2e: e2e-k8s
 
 gen-openapi:
 	@echo "Generating OpenAPI spec..."
@@ -285,38 +318,20 @@ KIND_CLUSTER_NAME ?= agentregistry
 KIND_IMAGE_VERSION ?= 1.34.0
 KIND_CLUSTER_CONTEXT ?= kind-$(KIND_CLUSTER_NAME)
 KIND_NAMESPACE ?= agentregistry
-KIND_BIN = $(shell test -x bin/kind && echo bin/kind || echo kind)
-KUBECONFIG_PERM ?= $(shell \
-  if [ "$$(uname -s | tr '[:upper:]' '[:lower:]')" = "darwin" ]; then \
-    stat -f "%Lp" ~/.kube/config 2>/dev/null || echo "600"; \
-  else \
-    stat -c "%a" ~/.kube/config 2>/dev/null || echo "600"; \
-  fi)
-
-.PHONY: install-tools
-install-tools: ## Install required tools into ./bin
-	@mkdir -p bin
-	GOBIN=$(PWD)/bin go install sigs.k8s.io/kind@v0.27.0
-	@echo "✓ kind installed to bin/kind"
 
 .PHONY: create-kind-cluster
-create-kind-cluster: install-tools ## Create a local Kind cluster with MetalLB
-	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) KIND_IMAGE_VERSION=$(KIND_IMAGE_VERSION) bash ./scripts/kind/setup-kind.sh
-	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) bash ./scripts/kind/setup-metallb.sh
+create-kind-cluster: ## Create a local Kind cluster with MetalLB (skips if cluster already exists)
+	@if go tool kind get clusters 2>/dev/null | grep -qx "$(KIND_CLUSTER_NAME)"; then \
+	  echo "Kind cluster '$(KIND_CLUSTER_NAME)' already exists, skipping"; \
+	else \
+	  KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) KIND_IMAGE_VERSION=$(KIND_IMAGE_VERSION) bash ./scripts/kind/setup-kind.sh; \
+	  KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) bash ./scripts/kind/setup-metallb.sh; \
+	fi
 
-.PHONY: use-kind-cluster
-use-kind-cluster: ## Merge kind kubeconfig and set default namespace
-	@TMP_KUBECONFIG=$$(mktemp) && chmod 600 $$TMP_KUBECONFIG && \
-	  $(KIND_BIN) get kubeconfig --name $(KIND_CLUSTER_NAME) > $$TMP_KUBECONFIG && \
-	  KUBECONFIG=~/.kube/config:$$TMP_KUBECONFIG kubectl config view --merge --flatten > ~/.kube/config.tmp && \
-	  mv ~/.kube/config.tmp ~/.kube/config && chmod $(KUBECONFIG_PERM) ~/.kube/config && \
-	  rm -f $$TMP_KUBECONFIG
-	kubectl --context $(KIND_CLUSTER_CONTEXT) create namespace $(KIND_NAMESPACE) || true
-	kubectl --context $(KIND_CLUSTER_CONTEXT) config set-context --current --namespace $(KIND_NAMESPACE) || true
 
 .PHONY: delete-kind-cluster
 delete-kind-cluster: ## Delete the local Kind cluster
-	$(KIND_BIN) delete cluster --name $(KIND_CLUSTER_NAME)
+	go tool kind delete cluster --name $(KIND_CLUSTER_NAME)
 
 .PHONY: prune-kind-cluster
 prune-kind-cluster: ## Prune dangling container images from the Kind control-plane node
@@ -367,9 +382,13 @@ endif
 	    --wait \
 	    --timeout=5m;
 
-## Set up a full local K8s dev environment (Kind + PostgreSQL/pgvector + AgentRegistry)
+.PHONY: install-kagent
+install-kagent: ## Install kagent on the Kind cluster (downloads CLI if absent)
+	KUBE_CONTEXT=$(KIND_CLUSTER_CONTEXT) bash ./scripts/kind/install-kagent.sh
+
+## Set up a full local K8s dev environment (Kind + PostgreSQL/pgvector + AgentRegistry + kagent).
 .PHONY: setup-kind-cluster
-setup-kind-cluster: create-kind-cluster install-postgresql install-agentregistry
+setup-kind-cluster: create-kind-cluster install-postgresql install-agentregistry install-kagent
 
 bin/arctl-linux-amd64:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o bin/arctl-linux-amd64 cmd/cli/main.go
@@ -516,22 +535,11 @@ charts-test: _helm-check charts-deps helm-unittest-install
 
 .PHONY: helm-unittest-install
 helm-unittest-install: _helm-check
-	@echo "Checking for helm-unittest plugin..."
-	@if ! $(HELM) plugin list | awk '{print $$1}' | grep -q '^unittest$$'; then \
-	  echo "helm-unittest plugin not found — installing from $(HELM_PLUGIN_UNITTEST_URL)"; \
-	  if $(HELM) plugin install $(HELM_PLUGIN_UNITTEST_URL) --version $(HELM_PLUGIN_UNITTEST_VERSION) $(HELM_PLUGIN_INSTALL_FLAGS) ; then \
-	    echo "helm-unittest installed (with HELM_PLUGIN_INSTALL_FLAGS)"; \
-	  else \
-	    echo "Install with HELM_PLUGIN_INSTALL_FLAGS failed; retrying without flags..."; \
-	    if $(HELM) plugin install $(HELM_PLUGIN_UNITTEST_URL) --version $(HELM_PLUGIN_UNITTEST_VERSION) ; then \
-	      echo "helm-unittest installed (without HELM_PLUGIN_INSTALL_FLAGS)"; \
-	    else \
-	      echo "ERROR: helm-unittest install failed. Check network / plugin URL."; exit 1; \
-	    fi; \
-	  fi; \
-	else \
-	  echo "helm-unittest plugin already installed"; \
-	fi
+	HELM=$(HELM) \
+	HELM_PLUGIN_UNITTEST_URL=$(HELM_PLUGIN_UNITTEST_URL) \
+	HELM_PLUGIN_UNITTEST_VERSION=$(HELM_PLUGIN_UNITTEST_VERSION) \
+	HELM_PLUGIN_INSTALL_FLAGS="$(HELM_PLUGIN_INSTALL_FLAGS)" \
+	bash ./scripts/install-helm-unittest.sh
 
 # Convenience: package → push → test.
 .PHONY: charts-all

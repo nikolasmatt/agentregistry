@@ -93,6 +93,9 @@ var mcpDeployTargets = []deployTarget{
 func TestAgentDeploy(t *testing.T) {
 	for _, target := range agentDeployTargets {
 		t.Run(target.name, func(t *testing.T) {
+			if target.name == "kubernetes" && !IsK8sBackend() {
+				t.Skip("skipping kubernetes deploy target: E2E_BACKEND=docker")
+			}
 			regURL := RegistryURL(t)
 			tmpDir := t.TempDir()
 			agentName := UniqueAgentName("e2edpl" + target.name[:3])
@@ -152,6 +155,9 @@ func TestAgentDeploy(t *testing.T) {
 func TestMCPDeploy(t *testing.T) {
 	for _, target := range mcpDeployTargets {
 		t.Run(target.name, func(t *testing.T) {
+			if target.name == "kubernetes" && !IsK8sBackend() {
+				t.Skip("skipping kubernetes deploy target: E2E_BACKEND=docker")
+			}
 			regURL := RegistryURL(t)
 			tmpDir := t.TempDir()
 			mcpName := UniqueNameWithPrefix("e2e-dpl-" + target.name[:3])
@@ -315,6 +321,9 @@ func removeLocalDeployment(t *testing.T) {
 }
 
 func TestDeleteDeploymentRemovesKubernetesResources(t *testing.T) {
+	if !IsK8sBackend() {
+		t.Skip("skipping kubernetes deletion test: E2E_BACKEND=docker")
+	}
 	kubeContext := kubeContextForE2E(t)
 	if !kubeContextReachable(kubeContext) {
 		t.Skipf("kube context %q is not reachable", kubeContext)

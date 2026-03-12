@@ -4,16 +4,9 @@ set -o errexit
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KIND="${SCRIPT_DIR}/../../bin/kind"
-if [ ! -x "${KIND}" ]; then
-  KIND="$(command -v kind || true)"
-fi
 
-if [ -z "${KIND}" ] || [ ! -x "${KIND}" ]; then
-  echo "Error: 'kind' binary not found." >&2
-  echo "Run 'make install-tools' to install it, or ensure 'kind' is on your PATH." >&2
-  exit 1
-fi
+# Use kind via go tool directives (go.mod) so no separate install step is needed.
+KIND=(go tool kind)
 
 KIND_CLUSTER_NAME=${KIND_CLUSTER_NAME:-agentregistry}
 KIND_IMAGE_VERSION=${KIND_IMAGE_VERSION:-1.34.0}
@@ -38,12 +31,27 @@ fi
 # https://github.com/kubernetes-sigs/kind/issues/2875
 # https://github.com/containerd/containerd/blob/main/docs/cri/config.md#registry-configuration
 # See: https://github.com/containerd/containerd/blob/main/docs/hosts.md
-if "${KIND}" get clusters | grep -qx "${KIND_CLUSTER_NAME}"; then
-  echo "Kind cluster '${KIND_CLUSTER_NAME}' already exists; skipping create."
-else
-  "${KIND}" create cluster --name "${KIND_CLUSTER_NAME}" \
-    --config scripts/kind/kind-config.yaml \
-    --image="kindest/node:v${KIND_IMAGE_VERSION}"
+# On Linux, Docker containers cannot reach the host via 127.0.0.1 (loopback is
+# network-namespace local). Bind the API server on all interfaces so it is
+# reachable from the Docker bridge network, and patch the kubeconfig afterwards
+# to use the bridge gateway IP instead of 0.0.0.0.
+if [ "$(uname -s)" = "Linux" ]; then
+  echo "Linux: patching Kind config to bind API server on 0.0.0.0..."
+  sed -i 's/apiServerAddress: "127.0.0.1"/apiServerAddress: "0.0.0.0"/' \
+    "${SCRIPT_DIR}/kind-config.yaml"
+fi
+
+"${KIND[@]}" create cluster --name "${KIND_CLUSTER_NAME}" \
+  --config "${SCRIPT_DIR}/kind-config.yaml" \
+  --image="kindest/node:v${KIND_IMAGE_VERSION}"
+
+if [ "$(uname -s)" = "Linux" ]; then
+  GATEWAY=$(docker network inspect bridge -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}')
+  if [ -n "${GATEWAY}" ]; then
+    echo "Linux: patching kubeconfig to use Docker bridge gateway ${GATEWAY}..."
+    sed -i "s|server: https://0.0.0.0:|server: https://${GATEWAY}:|g" \
+      "${HOME}/.kube/config"
+  fi
 fi
 
 # 3. Add the registry config to the nodes
@@ -55,7 +63,7 @@ fi
 # We want a consistent name that works from both ends, so we tell containerd to
 # alias localhost:${reg_port} to the registry container when pulling images
 REGISTRY_DIR="/etc/containerd/certs.d/localhost:${reg_port}"
-for node in $("${KIND}" get nodes --name "${KIND_CLUSTER_NAME}"); do
+for node in $("${KIND[@]}" get nodes --name "${KIND_CLUSTER_NAME}"); do
   docker exec "${node}" mkdir -p "${REGISTRY_DIR}"
   cat <<EOF | docker exec -i "${node}" cp /dev/stdin "${REGISTRY_DIR}/hosts.toml"
 [host."http://${reg_name}:5000"]
