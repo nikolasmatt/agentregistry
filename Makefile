@@ -353,6 +353,26 @@ install-kagent: ## Install kagent on the Kind cluster (downloads CLI if absent)
 .PHONY: setup-kind-cluster
 setup-kind-cluster: create-kind-cluster install-postgresql install-agentregistry install-kagent ## Set up the full local Kind development environment
 
+.PHONY: dump-kind-state
+dump-kind-state: ## Dump Kind cluster state for debugging (pods, events, kagent logs)
+	@echo "=== Kind clusters ==="
+	@go tool kind get clusters 2>/dev/null || true
+	@echo ""
+	@echo "=== Pods ==="
+	@kubectl get pods -A --context $(KIND_CLUSTER_CONTEXT) 2>/dev/null || true
+	@echo ""
+	@echo "=== Pod describe ==="
+	@kubectl describe pods --context $(KIND_CLUSTER_CONTEXT) 2>/dev/null || true
+	@echo ""
+	@echo "=== Events ==="
+	@kubectl get events -A --sort-by='.lastTimestamp' --context $(KIND_CLUSTER_CONTEXT) 2>/dev/null | tail -50 || true
+	@echo ""
+	@echo "=== Kagent pods ==="
+	@kubectl get pods -n kagent --context $(KIND_CLUSTER_CONTEXT) 2>/dev/null || true
+	@echo ""
+	@echo "=== Kagent controller logs ==="
+	@kubectl logs deployment/kagent-controller -n kagent --context $(KIND_CLUSTER_CONTEXT) --tail=100 2>/dev/null || true
+
 bin/arctl-linux-amd64:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o bin/arctl-linux-amd64 cmd/cli/main.go
 
