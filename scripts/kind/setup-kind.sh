@@ -43,14 +43,14 @@ fi
   --image="kindest/node:v${KIND_IMAGE_VERSION}"
 
 if [ "$(uname -s)" = "Linux" ]; then
-  # Use the Kind node's IP (already in the API server TLS cert) rather than the
-  # Docker bridge gateway (172.17.0.1), which is not in the cert and causes
-  # x509 validation failures.
-  NODE_IP=$(docker inspect "${KIND_CLUSTER_NAME}-control-plane" \
-    --format '{{.NetworkSettings.Networks.kind.IPAddress}}' 2>/dev/null || true)
-  if [ -n "${NODE_IP}" ]; then
-    echo "Linux: patching kubeconfig to use Kind node IP ${NODE_IP}..."
-    sed -i "s|server: https://0.0.0.0:|server: https://${NODE_IP}:|g" \
+  # Patch the kubeconfig to use the Docker bridge gateway (172.17.0.1).
+  # This IP is reachable from both the host and from Docker containers on the
+  # bridge network, and is included in the API server cert SANs via
+  # kubeadmConfigPatches in kind-config.yaml.
+  GATEWAY=$(docker network inspect bridge -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}')
+  if [ -n "${GATEWAY}" ]; then
+    echo "Linux: patching kubeconfig to use Docker bridge gateway ${GATEWAY}..."
+    sed -i "s|server: https://0.0.0.0:|server: https://${GATEWAY}:|g" \
       "${HOME}/.kube/config"
   fi
 fi

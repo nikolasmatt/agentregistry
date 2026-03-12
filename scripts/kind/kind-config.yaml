@@ -22,15 +22,21 @@ networking:
 runtimeConfig:
   "api/alpha": "false"
 
-# add "docker" to the apiServer certSANs for docker-in-docker (DinD) setups
-kubeadmConfigPatchesJSON6902:
-  - group: kubeadm.k8s.io
-    version: v1beta2
+# Add extra certSANs so TLS verification works without --insecure-skip-tls-verify:
+#   "docker"      - for docker-in-docker (DinD) setups
+#   "172.17.0.1"  - Docker bridge gateway; reachable from both the host and
+#                   containers, used as the API server address in the kubeconfig
+#                   on Linux (see setup-kind.sh).
+# Strategic merge patch is used instead of kubeadmConfigPatchesJSON6902 because
+# JSON6902 `add` to /apiServer/certSANs/- silently fails when certSANs is unset.
+kubeadmConfigPatches:
+  - |
     kind: ClusterConfiguration
-    patch: |
-      - op: add
-        path: /apiServer/certSANs/-
-        value: docker
+    apiVersion: kubeadm.k8s.io/v1beta3
+    apiServer:
+      certSANs:
+        - "docker"
+        - "172.17.0.1"
 
 # this is the default configuration for nodes
 nodes:
