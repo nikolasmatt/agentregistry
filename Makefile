@@ -180,9 +180,15 @@ e2e-k8s: setup-kind-cluster build-cli
 
 # Run e2e tests (default: k8s)
 .PHONY: e2e
-e2e: e2e-k8s
+e2e: ## Run end-to-end tests (default: k8s)
+	@if [ "$(E2E_BACKEND)" = "docker" ]; then \
+	  $(MAKE) e2e-docker; \
+	else \
+	  $(MAKE) e2e-k8s; \
+	fi
 
-gen-openapi:
+.PHONY: gen-openapi
+gen-openapi: ## Generate the OpenAPI specification
 	@echo "Generating OpenAPI spec..."
 	go run ./cmd/tools/gen-openapi -output openapi.yaml
 
