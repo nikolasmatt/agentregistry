@@ -22,10 +22,7 @@ networking:
 runtimeConfig:
   "api/alpha": "false"
 
-# add to the apiServer certSANs:
-#   "docker"        - for docker-in-docker (DinD) setups
-#   "172.17.0.1"    - Docker bridge gateway IP on Linux (CI), so the agentregistry
-#                     server container can reach the Kind API server without disabling TLS
+# add "docker" to the apiServer certSANs for docker-in-docker (DinD) setups
 kubeadmConfigPatchesJSON6902:
   - group: kubeadm.k8s.io
     version: v1beta2
@@ -34,9 +31,6 @@ kubeadmConfigPatchesJSON6902:
       - op: add
         path: /apiServer/certSANs/-
         value: docker
-      - op: add
-        path: /apiServer/certSANs/-
-        value: "172.17.0.1"
 
 # this is the default configuration for nodes
 nodes:
