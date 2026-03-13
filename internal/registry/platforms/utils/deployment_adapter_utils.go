@@ -111,6 +111,11 @@ func ResolveAgent(
 		return nil, err
 	}
 
+	prompts, err := registryService.ResolveAgentManifestPrompts(ctx, &agentResp.Agent.AgentManifest)
+	if err != nil {
+		return nil, err
+	}
+
 	return &platformtypes.ResolvedAgentConfig{
 		Agent: &platformtypes.Agent{
 			Name:               agentResp.Agent.Name,
@@ -118,10 +123,12 @@ func ResolveAgent(
 			DeploymentID:       deployment.ID,
 			Deployment:         platformtypes.AgentDeployment{Image: agentResp.Agent.Image, Env: envValues, Port: DefaultLocalAgentPort},
 			ResolvedMCPServers: resolvedConfigs,
+			ResolvedPrompts:    prompts,
 			Skills:             skills,
 		},
 		ResolvedPlatformServers: resolvedServers,
 		ResolvedConfigServers:   resolvedConfigs,
+		ResolvedPrompts:         prompts,
 	}, nil
 }
 

@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/agentregistry-dev/agentregistry/internal/client"
@@ -328,12 +329,13 @@ func TestPreRunSetup(t *testing.T) {
 type mockDaemonManager struct {
 	running     bool
 	startCalled bool
+	startErr    error
 }
 
 func (m *mockDaemonManager) IsRunning() bool { return m.running }
 func (m *mockDaemonManager) Start() error {
 	m.startCalled = true
-	return nil
+	return m.startErr
 }
 
 // mockAuthnProvider for unit tests.
@@ -351,3 +353,73 @@ func (m *mockAuthnProvider) Authenticate(context.Context) (string, error) {
 
 var _ types.DaemonManager = (*mockDaemonManager)(nil)
 var _ types.CLIAuthnProvider = (*mockAuthnProvider)(nil)
+
+func TestEnsureDaemonRunning(t *testing.T) {
+	startErr := errors.New("start failed")
+	dockerComposeErr := errors.New("docker compose is not available")
+	notReadyErr := errors.New("daemon did not become ready within 30 seconds")
+
+	tests := []struct {
+		name            string
+		dm              *mockDaemonManager
+		wantErr         string
+		wantStartCalled bool
+	}{
+		{
+			name:            "docker compose not available",
+			dm:              &mockDaemonManager{startErr: dockerComposeErr},
+			wantErr:         "docker compose is not available",
+			wantStartCalled: true,
+		},
+		{
+			name:            "daemon already running",
+			dm:              &mockDaemonManager{running: true},
+			wantErr:         "",
+			wantStartCalled: false,
+		},
+		{
+			name:            "daemon not running starts successfully",
+			dm:              &mockDaemonManager{running: false},
+			wantErr:         "",
+			wantStartCalled: true,
+		},
+		{
+			name:            "daemon start fails",
+			dm:              &mockDaemonManager{running: false, startErr: startErr},
+			wantErr:         "failed to start daemon",
+			wantStartCalled: true,
+		},
+		{
+			name:            "daemon started but not ready",
+			dm:              &mockDaemonManager{running: false, startErr: notReadyErr},
+			wantErr:         "daemon did not become ready",
+			wantStartCalled: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ensureDaemonRunning(tt.dm)
+
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("error %q does not contain %q", err.Error(), tt.wantErr)
+				}
+			}
+
+			if tt.wantStartCalled && !tt.dm.startCalled {
+				t.Error("expected Start() to be called")
+			}
+			if !tt.wantStartCalled && tt.dm.startCalled {
+				t.Error("expected Start() not to be called")
+			}
+		})
+	}
+}

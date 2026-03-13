@@ -9,6 +9,7 @@ import (
 	versionpkg "github.com/agentregistry-dev/agentregistry/internal/version"
 	"github.com/agentregistry-dev/agentregistry/pkg/printer"
 	"github.com/stoewer/go-strcase"
+	"golang.org/x/mod/semver"
 )
 
 const DefaultUserName = "user"
@@ -80,7 +81,12 @@ func ResolveVersion(flagVersion, manifestVersion string) string {
 	return "latest"
 }
 
-// FormatVersionForDisplay normalizes version display with a leading "v".
+// FormatVersionForDisplay adds a leading "v" only for valid semver values.
+// Non-semver labels are returned unchanged.
 func FormatVersionForDisplay(version string) string {
-	return versionpkg.EnsureVPrefix(version)
+	versionWithV := versionpkg.EnsureVPrefix(version)
+	if !semver.IsValid(versionWithV) {
+		return version
+	}
+	return versionWithV
 }

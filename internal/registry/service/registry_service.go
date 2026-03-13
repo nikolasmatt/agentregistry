@@ -1165,7 +1165,7 @@ func (s *registryServiceImpl) createManagedDeploymentRecord(ctx context.Context,
 		ID:               req.ID,
 		ServerName:       strings.TrimSpace(req.ServerName),
 		Version:          strings.TrimSpace(req.Version),
-		Status:           "deploying",
+		Status:           models.DeploymentStatusDeploying,
 		Env:              req.Env,
 		ProviderConfig:   req.ProviderConfig,
 		ProviderMetadata: req.ProviderMetadata,
@@ -1218,7 +1218,7 @@ func (s *registryServiceImpl) createManagedDeploymentRecord(ctx context.Context,
 }
 
 func (s *registryServiceImpl) applyDeploymentActionResult(ctx context.Context, deploymentID string, result *models.DeploymentActionResult) error {
-	status := "deployed"
+	status := models.DeploymentStatusDeployed
 	if result != nil {
 		if trimmedStatus := strings.TrimSpace(result.Status); trimmedStatus != "" {
 			status = trimmedStatus
@@ -1252,7 +1252,7 @@ func (s *registryServiceImpl) applyFailedDeploymentAction(
 	deployErr error,
 	result *models.DeploymentActionResult,
 ) error {
-	status := "failed"
+	status := models.DeploymentStatusFailed
 	if result != nil {
 		if trimmedStatus := strings.TrimSpace(result.Status); trimmedStatus != "" {
 			status = trimmedStatus
@@ -1369,6 +1369,45 @@ func (s *registryServiceImpl) resolveSkillRef(ctx context.Context, skill models.
 	}
 
 	return api.AgentSkillRef{}, fmt.Errorf("skill %q (version %s): no docker/oci package or git repository found", registrySkillName, version)
+}
+
+// ResolveAgentManifestPrompts resolves registry-type prompt references from the
+// agent manifest into concrete prompt content that can be written to prompts.json.
+func (s *registryServiceImpl) ResolveAgentManifestPrompts(ctx context.Context, manifest *models.AgentManifest) ([]api.ResolvedPrompt, error) {
+	if manifest == nil || len(manifest.Prompts) == 0 {
+		return nil, nil
+	}
+
+	resolved := make([]api.ResolvedPrompt, 0, len(manifest.Prompts))
+	for _, ref := range manifest.Prompts {
+		promptName := strings.TrimSpace(ref.RegistryPromptName)
+		if promptName == "" {
+			return nil, fmt.Errorf("prompt name is required")
+		}
+
+		version := strings.TrimSpace(ref.RegistryPromptVersion)
+
+		var promptResp *models.PromptResponse
+		var err error
+		if version == "" || version == "latest" {
+			promptResp, err = s.GetPromptByName(ctx, promptName)
+		} else {
+			promptResp, err = s.GetPromptByNameAndVersion(ctx, promptName, version)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("resolve prompt %q version %q: %w", promptName, version, err)
+		}
+
+		displayName := ref.Name
+		if displayName == "" {
+			displayName = promptName
+		}
+		resolved = append(resolved, api.ResolvedPrompt{
+			Name:    displayName,
+			Content: promptResp.Prompt.Content,
+		})
+	}
+	return resolved, nil
 }
 
 func (s *registryServiceImpl) ensureSemanticEmbedding(ctx context.Context, opts *database.SemanticSearchOptions) error {

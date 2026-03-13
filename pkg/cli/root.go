@@ -16,8 +16,7 @@ import (
 	"github.com/agentregistry-dev/agentregistry/internal/cli/prompt"
 	"github.com/agentregistry-dev/agentregistry/internal/cli/skill"
 	"github.com/agentregistry-dev/agentregistry/internal/client"
-	"github.com/agentregistry-dev/agentregistry/internal/utils"
-	"github.com/agentregistry-dev/agentregistry/pkg/daemon"
+	"github.com/agentregistry-dev/agentregistry/pkg/daemon/dockercompose"
 	"github.com/agentregistry-dev/agentregistry/pkg/types"
 	"github.com/spf13/cobra"
 )
@@ -220,20 +219,12 @@ func preRunBehavior(cmd *cobra.Command, baseURL string) (skipSetup bool, autoSta
 func preRunSetup(ctx context.Context, cmd *cobra.Command, baseURL, token string, autoStartDaemon bool) (*client.Client, error) {
 	dm := cliOptions.DaemonManager
 	if dm == nil {
-		dm = daemon.NewDaemonManager(nil)
+		dm = dockercompose.NewManager(dockercompose.DefaultConfig())
 	}
 
 	if autoStartDaemon {
-		if !utils.IsDockerComposeAvailable() {
-			fmt.Println("Docker compose is not available. Please install docker compose and try again.")
-			fmt.Println("See https://docs.docker.com/compose/install/ for installation instructions.")
-			fmt.Println("agent registry uses docker compose to start the server and the agent gateway.")
-			return nil, fmt.Errorf("docker compose is not available")
-		}
-		if !dm.IsRunning() {
-			if err := dm.Start(); err != nil {
-				return nil, fmt.Errorf("failed to start daemon: %w", err)
-			}
+		if err := ensureDaemonRunning(dm); err != nil {
+			return nil, err
 		}
 	}
 
@@ -264,4 +255,14 @@ func preRunSetup(ctx context.Context, cmd *cobra.Command, baseURL, token string,
 		return nil, fmt.Errorf("API client not initialized: %w", err)
 	}
 	return c, nil
+}
+
+func ensureDaemonRunning(dm types.DaemonManager) error {
+	if dm.IsRunning() {
+		return nil
+	}
+	if err := dm.Start(); err != nil {
+		return fmt.Errorf("failed to start daemon: %w", err)
+	}
+	return nil
 }
