@@ -16,6 +16,7 @@ DOCKER_BUILD_ARGS ?= --push --platform linux/$(LOCALARCH)
 BUILD_DATE ?= $(shell date -u '+%Y-%m-%d')
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD || echo "unknown")
 VERSION ?= $(shell git describe --tags --always 2>/dev/null | grep v || echo "v0.0.0-$(GIT_COMMIT)")
+KAGENT_VERSION ?= v0.8.0-beta6
 
 # Copy .env.example to .env if it doesn't exist
 .env:
@@ -367,7 +368,7 @@ endif
 
 .PHONY: install-kagent
 install-kagent: ## Install kagent on the Kind cluster (downloads CLI if absent)
-	KUBE_CONTEXT=$(KIND_CLUSTER_CONTEXT) bash ./scripts/kind/install-kagent.sh
+	KUBE_CONTEXT=$(KIND_CLUSTER_CONTEXT) KAGENT_VERSION=$(KAGENT_VERSION) bash ./scripts/kind/install-kagent.sh
 
 ## Set up a full local K8s dev environment (Kind + PostgreSQL/pgvector + AgentRegistry + kagent).
 .PHONY: setup-kind-cluster
