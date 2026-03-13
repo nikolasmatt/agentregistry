@@ -30,7 +30,7 @@ func TestMain(m *testing.M) {
 
 	registryURL = os.Getenv("ARCTL_API_BASE_URL")
 	if registryURL == "" {
-		log.Fatal("ARCTL_API_BASE_URL not set — run tests via `make e2e-docker` or `make e2e-k8s`")
+		log.Fatal("ARCTL_API_BASE_URL not set — run tests via `make test-e2e-docker` or `make test-e2e-k8s`")
 	}
 
 	log.Printf("Configuration:")
