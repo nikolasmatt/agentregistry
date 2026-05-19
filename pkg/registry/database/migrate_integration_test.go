@@ -245,7 +245,10 @@ func TestIntegrationMigrateTo_ForwardAndBackward(t *testing.T) {
 	if err := m.MigrateTo(ctx, 2); err != nil {
 		t.Fatalf("MigrateTo(2): %v", err)
 	}
-	v, _ := m.CurrentVersion(ctx)
+	v, err := m.CurrentVersion(ctx)
+	if err != nil {
+		t.Fatalf("CurrentVersion after MigrateTo(2): %v", err)
+	}
 	if v != 2 {
 		t.Errorf("after MigrateTo(2): CurrentVersion = %d; want 2", v)
 	}
@@ -256,7 +259,10 @@ func TestIntegrationMigrateTo_ForwardAndBackward(t *testing.T) {
 	if err := m.MigrateTo(ctx, 3); err != nil {
 		t.Fatalf("MigrateTo(3): %v", err)
 	}
-	v, _ = m.CurrentVersion(ctx)
+	v, err = m.CurrentVersion(ctx)
+	if err != nil {
+		t.Fatalf("CurrentVersion after MigrateTo(3): %v", err)
+	}
 	if v != 3 {
 		t.Errorf("after MigrateTo(3): CurrentVersion = %d; want 3", v)
 	}
@@ -266,7 +272,10 @@ func TestIntegrationMigrateTo_ForwardAndBackward(t *testing.T) {
 	if err := m.MigrateTo(ctx, 1); err != nil {
 		t.Fatalf("MigrateTo(1): %v", err)
 	}
-	v, _ = m.CurrentVersion(ctx)
+	v, err = m.CurrentVersion(ctx)
+	if err != nil {
+		t.Fatalf("CurrentVersion after MigrateTo(1): %v", err)
+	}
 	if v != 1 {
 		t.Errorf("after MigrateTo(1): CurrentVersion = %d; want 1", v)
 	}
@@ -340,14 +349,26 @@ func TestIntegrationForce_Idempotent(t *testing.T) {
 // source where every migration is Skip-filtered (the realistic shape
 // of an "empty" source — feature-flag-gated migrations all off)
 // reports CurrentVersion=0 and Status applied=[] even when
-// schema_migrations contains rows from another source. The
-// `BETWEEN low AND low-1` query returns no rows.
+// schema_migrations contains a row at exactly the source's nominal
+// floor. The `BETWEEN low AND low-1` query returns no rows, which is
+// a strictly stronger test than checking "no rows >= 501": we plant
+// v501 directly so a naive max-version filter would surface it.
 func TestIntegrationEmptySourceRange(t *testing.T) {
 	conn, ctx := newIntegrationConn(t)
 	// First apply a populated source at offset 0.
 	populated := NewMigrator(conn, fullConfig())
 	if err := populated.Migrate(ctx); err != nil {
 		t.Fatalf("populated Migrate: %v", err)
+	}
+
+	// Plant a competing row at v501 — exactly where the empty source's
+	// nominal range would start (offset 500 + 1). A buggy sentinel that
+	// returns (low, low) or any range covering v501 would surface this
+	// row. The correct (low, low-1) = (501, 500) sentinel excludes it.
+	if _, err := conn.Exec(ctx,
+		"INSERT INTO schema_migrations (version, name) VALUES ($1, $2)",
+		501, "competing_v501"); err != nil {
+		t.Fatalf("plant competing row at v501: %v", err)
 	}
 
 	// Empty-via-Skip source at offset 500. EnsureTable=false because
@@ -364,14 +385,14 @@ func TestIntegrationEmptySourceRange(t *testing.T) {
 		t.Fatalf("empty source CurrentVersion: %v", err)
 	}
 	if v != 0 {
-		t.Errorf("empty source CurrentVersion = %d; want 0", v)
+		t.Errorf("empty source CurrentVersion = %d; want 0 (v501 row must NOT match the sentinel range)", v)
 	}
 	applied, _, err := empty.Status(ctx)
 	if err != nil {
 		t.Fatalf("empty source Status: %v", err)
 	}
 	if len(applied) != 0 {
-		t.Errorf("empty source applied = %v; want empty", applied)
+		t.Errorf("empty source applied = %v; want empty (v501 row must NOT match the sentinel range)", applied)
 	}
 }
 

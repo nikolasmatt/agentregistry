@@ -44,10 +44,9 @@ down N` / `arctl db migrate goto V` (backward).
   `.down.sql`. `arctl db migrate down` across that migration will
   fail with `ErrNotReversible`, naming the file — that's the
   expected failure mode for irreversible changes.
-- Existing migrations `001–006` ship up-only for backward
-  compatibility. Down support is going-forward-only: backfill is
-  additive (drop a `.down.sql` next to the existing `.sql`) but not
-  required.
+- Migrations predating this convention ship up-only. Down support is
+  going-forward-only: backfill is additive (drop a `.down.sql` next
+  to an existing `.sql`) but not required.
 
 ## Skip-gated migrations
 
@@ -98,5 +97,5 @@ focused on migrator behavior, not v1alpha1 semantics.
 Run them via:
 
 ```
-make test    # runs unit + integration against localhost:5432
+make test    # runs the full suite; the integration cases need Postgres at localhost:5432
 ```
