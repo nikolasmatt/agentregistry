@@ -78,7 +78,12 @@ func App(ctx context.Context, opts ...types.AppOptions) error {
 	}
 	authz := auth.Authorizer{Authz: authzProvider}
 
-	db, err := openDatabase(ctx, dbCtx, cfg, options, authz)
+	// Effective SkipMigrations: AppOptions wins when set, otherwise the
+	// env-driven Config value (AGENT_REGISTRY_SKIP_MIGRATIONS) applies.
+	// Either may be true; both being false means run the migrator.
+	skipMigrations := options.SkipMigrations || cfg.SkipMigrations
+
+	db, err := openDatabase(ctx, dbCtx, cfg, options, authz, skipMigrations)
 	if err != nil {
 		return err
 	}
@@ -387,6 +392,7 @@ func openDatabase(
 	cfg *config.Config,
 	options types.AppOptions,
 	authz auth.Authorizer,
+	skipMigrations bool,
 ) (pkgdb.Store, error) {
 	if cfg.DatabaseURL == "noop" {
 		if options.DatabaseFactory == nil {
@@ -400,7 +406,7 @@ func openDatabase(
 		return db, nil
 	}
 
-	baseDB, err := internaldb.NewPostgreSQL(dbCtx, cfg.DatabaseURL, authz, cfg.Embeddings.Enabled)
+	baseDB, err := internaldb.NewPostgreSQL(dbCtx, cfg.DatabaseURL, authz, cfg.Embeddings.Enabled, skipMigrations)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to PostgreSQL: %w", err)
 	}

@@ -106,6 +106,19 @@ type AppOptions struct {
 	// database.
 	DatabaseFactory DatabaseFactory
 
+	// SkipMigrations skips the server's startup OSS migrator (the
+	// v1alpha1 migration set inside internaldb.NewPostgreSQL) so the
+	// server boots against a schema that was already migrated by
+	// `arctl db migrate up` (typically from CI/CD ahead of the
+	// rollout). DatabaseFactory-supplied migrators are NOT
+	// automatically skipped — downstream factories that run their own
+	// migrations should consult this same flag (e.g. via closure
+	// capture from AppOptions construction) to honor the operator's
+	// intent. Wins over the AGENT_REGISTRY_SKIP_MIGRATIONS /
+	// SKIP_MIGRATIONS env fallback when set true. Does not affect
+	// ClickHouse.
+	SkipMigrations bool
+
 	// RuntimeAdapters registers per-type PostUpsert/PostDelete
 	// hooks for the KindRuntime resource handler, keyed by the
 	// lowercase canonical Runtime.Spec.Type ("bedrockagentcore",

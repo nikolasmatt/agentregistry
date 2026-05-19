@@ -44,3 +44,35 @@ func TestNewConfig_RuntimeDirRespectsEnvOverride(t *testing.T) {
 		t.Fatalf("RuntimeDir should be %q when env var is set, got %q", custom, cfg.RuntimeDir)
 	}
 }
+
+func TestNewConfig_SkipMigrationsEnv(t *testing.T) {
+	cases := []struct {
+		name     string
+		prefixed string // value of AGENT_REGISTRY_SKIP_MIGRATIONS; "" means unset
+		bare     string // value of SKIP_MIGRATIONS; "" means unset
+		want     bool
+	}{
+		{"both unset", "", "", false},
+		{"prefixed true", "true", "", true},
+		{"bare true", "", "true", true},
+		{"bare false explicit", "", "false", false},
+		{"prefixed wins over bare", "true", "false", true},
+		{"prefixed false wins over bare true", "false", "true", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			os.Unsetenv("AGENT_REGISTRY_SKIP_MIGRATIONS")
+			os.Unsetenv("SKIP_MIGRATIONS")
+			if tc.prefixed != "" {
+				t.Setenv("AGENT_REGISTRY_SKIP_MIGRATIONS", tc.prefixed)
+			}
+			if tc.bare != "" {
+				t.Setenv("SKIP_MIGRATIONS", tc.bare)
+			}
+			cfg := NewConfig()
+			if cfg.SkipMigrations != tc.want {
+				t.Fatalf("SkipMigrations = %v; want %v (prefixed=%q bare=%q)", cfg.SkipMigrations, tc.want, tc.prefixed, tc.bare)
+			}
+		})
+	}
+}

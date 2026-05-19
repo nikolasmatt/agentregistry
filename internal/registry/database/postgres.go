@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -21,15 +22,20 @@ type PostgreSQL struct {
 }
 
 // NewPostgreSQL opens a pool against connectionURI, runs the v1alpha1
-// migrations against it, and returns a *PostgreSQL ready for use by the
-// generic v1alpha1 Store.
+// migrations against it (unless skipMigrations is true), and returns a
+// *PostgreSQL ready for use by the generic v1alpha1 Store.
 //
 // embeddingsEnabled gates the pgvector migration. When false, the
 // 003_embeddings.sql migration is skipped so a vanilla PostgreSQL
 // install (no pgvector extension) succeeds — semantic search /
 // indexing remains unavailable until the flag flips on, at which
 // point the migration applies on next boot.
-func NewPostgreSQL(ctx context.Context, connectionURI string, authz auth.Authorizer, embeddingsEnabled bool) (*PostgreSQL, error) {
+//
+// skipMigrations short-circuits the startup migrator entirely. Used
+// when migrations have been applied out-of-band by `arctl db migrate
+// up`. The pool is still parsed, opened, and pinged so a
+// misconfigured DB fails fast.
+func NewPostgreSQL(ctx context.Context, connectionURI string, authz auth.Authorizer, embeddingsEnabled, skipMigrations bool) (*PostgreSQL, error) {
 	config, err := pgxpool.ParseConfig(connectionURI)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse PostgreSQL config: %w", err)
@@ -48,6 +54,15 @@ func NewPostgreSQL(ctx context.Context, connectionURI string, authz auth.Authori
 
 	if err = pool.Ping(ctx); err != nil {
 		return nil, fmt.Errorf("failed to ping PostgreSQL: %w", err)
+	}
+
+	if skipMigrations {
+		// The gate can fire from AppOptions.SkipMigrations,
+		// AGENT_REGISTRY_SKIP_MIGRATIONS, or the bare SKIP_MIGRATIONS
+		// env — phrase neutrally so operators searching for any of
+		// the three see the line.
+		slog.Info("skipping v1alpha1 startup migrations (SkipMigrations enabled) — schema must already be applied")
+		return &PostgreSQL{pool: pool, authz: authz}, nil
 	}
 
 	conn, err := pool.Acquire(ctx)
