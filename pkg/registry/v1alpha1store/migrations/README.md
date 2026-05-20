@@ -2,87 +2,92 @@
 
 This directory holds the v1alpha1 Postgres migrations applied by both
 the server (at startup, unless `SkipMigrations` is set) and the
-`arctl db migrate` CLI.
+`arctl db migrate` CLI. The migrator is `golang-migrate/migrate v4`
+with the `pgx/v5` driver and the `iofs` source — see
+`pkg/registry/database/migrate.go`.
 
 ## File-naming convention
 
 ```
-NNN_short_name.sql           # the forward migration (required)
-NNN_short_name.down.sql      # the reverse migration (optional)
+NNN_short_name.up.sql        # forward (required)
+NNN_short_name.down.sql      # reverse (required by the iofs source)
 ```
 
 - `NNN` is the migration version, zero-padded to three digits. New
-  migrations get the next unused number. Pre-offset numbers are kept
-  small (the runtime `VersionOffset` is added when the migrator reads
-  the file — see `pkg/registry/database/migrate.go`).
+  migrations get the next unused number. Numbers do not have to be
+  contiguous — gaps are fine and stay in place forever once a number
+  has been used.
 - `short_name` is a lowercase, underscore-separated description of the
-  change. Used in slog output and in error messages — keep it
+  change. It appears in error messages and recovery logs — keep it
   readable.
-- Same prefix on both files: `005_widget_table.sql` pairs with
-  `005_widget_table.down.sql`. The loader pairs them by prefix; a
-  `.down.sql` whose `.sql` partner is missing is ignored.
+- Same prefix on both files. The iofs source pairs them by version
+  prefix and refuses to load if the pair is incomplete.
 
 ## Forward migrations
 
-`NNN_short_name.sql` is the schema change. It runs inside a
-transaction with the matching `schema_migrations` insert; either both
-land or both don't.
+`NNN_short_name.up.sql` is the schema change. **Do not wrap the file
+in `BEGIN;` / `COMMIT;`** — go-migrate runs the SQL through `Exec`,
+and Postgres autocommits single-statement DDL. Multi-statement
+migrations are not atomic by default; the auto-recovery wrapper in
+`pkg/registry/database/migrate.go` handles partial-failure cleanup
+(`Force(current-1)` on dirty state) so a failed migration leaves a
+clear actionable error.
 
-Keep it idempotent-friendly when reasonable (`CREATE TABLE IF NOT
-EXISTS`, `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`) so a half-applied
-state can be reconciled by re-running.
+Write idempotent DDL whenever the operation has a natural idempotent
+form, so a retry after partial failure is safe:
+
+| Use | Instead of |
+|---|---|
+| `CREATE TABLE IF NOT EXISTS ...` | `CREATE TABLE ...` |
+| `CREATE INDEX IF NOT EXISTS ...` | `CREATE INDEX ...` |
+| `ALTER TABLE ... ADD COLUMN IF NOT EXISTS ...` | `ALTER TABLE ... ADD COLUMN ...` |
+| `CREATE OR REPLACE FUNCTION ...` | `CREATE FUNCTION ...` |
+| `DROP TABLE IF EXISTS ...` | `DROP TABLE ...` |
 
 ## Reverse migrations
 
-`NNN_short_name.down.sql` is the inverse. It runs inside a transaction
-with the matching `schema_migrations` delete on `arctl db migrate
-down N` / `arctl db migrate goto V` (backward).
+`NNN_short_name.down.sql` is the inverse. The iofs source requires the
+file to exist (the pair is the unit of work); it does not run the
+file unless an operator invokes `arctl db migrate down` or backward
+`goto`.
 
-- If you can write a sensible reverse, do. New migrations should ship
-  with a `.down.sql` so operators can roll back.
-- If you genuinely can't (destructive forward, no reverse), omit the
-  `.down.sql`. `arctl db migrate down` across that migration will
-  fail with `ErrNotReversible`, naming the file — that's the
-  expected failure mode for irreversible changes.
-- Migrations predating this convention ship up-only. Down support is
-  going-forward-only: backfill is additive (drop a `.down.sql` next
-  to an existing `.sql`) but not required.
+- **Reversible migrations** — ship the inverse:
+  ```
+  005_widget_owner_index.up.sql:
+    CREATE INDEX IF NOT EXISTS widget_owner_idx ON widget (owner);
 
-## Skip-gated migrations
-
-A migration may be omitted from the install set when a runtime
-feature flag is off — `003_embeddings.sql` is gated on
-`AGENT_REGISTRY_EMBEDDINGS_ENABLED` so vanilla installs without the
-`pgvector` extension don't fail at boot. The gating predicate lives
-in `pkg/registry/v1alpha1store/migrator.go` (`Skip`), not in the
-filename. To gate a new migration, add to that predicate.
-
-Operators toggling such a flag after applying the migration will see
-"orphan" rows in `schema_migrations` (applied versions whose `.sql`
-is no longer visible). `arctl db migrate down` / `force` surface a
-hint pointing at the Skip predicate; restoring the configuration that
-was in effect when the migration was applied makes the row
-reachable again.
+  005_widget_owner_index.down.sql:
+    DROP INDEX IF EXISTS widget_owner_idx;
+  ```
+- **Up-only / destructive migrations** — write a `.down.sql` that
+  fails loudly so attempted rollbacks surface clearly:
+  ```sql
+  DO $$ BEGIN
+    RAISE EXCEPTION 'migration NNN_<name> is not reversible (up-only)';
+  END $$;
+  ```
+  All migrations predating the convention switch (001/002/003/004/006/007/008)
+  ship with this raise-exception form.
 
 ## Quick examples
 
 A simple forward + reverse pair:
 
 ```
-007_widget_owner_index.sql:
+NNN_widget_owner_index.up.sql:
   CREATE INDEX IF NOT EXISTS widget_owner_idx ON widget (owner);
 
-007_widget_owner_index.down.sql:
+NNN_widget_owner_index.down.sql:
   DROP INDEX IF EXISTS widget_owner_idx;
 ```
 
 A column add:
 
 ```
-008_widget_archived.sql:
-  ALTER TABLE widget ADD COLUMN archived BOOLEAN NOT NULL DEFAULT FALSE;
+NNN_widget_archived.up.sql:
+  ALTER TABLE widget ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;
 
-008_widget_archived.down.sql:
+NNN_widget_archived.down.sql:
   ALTER TABLE widget DROP COLUMN IF EXISTS archived;
 ```
 
