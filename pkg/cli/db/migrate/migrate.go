@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -103,8 +104,8 @@ func sourceNames(srcs []Source) string {
 	return strings.Join(names, ", ")
 }
 
-func withSourceMigrator(src Source, dsn string, fn func(mg *migrate.Migrate) error) error {
-	mg, err := src.NewMigrator(dsn)
+func withSourceMigrator(ctx context.Context, src Source, dsn string, fn func(mg *migrate.Migrate) error) error {
+	mg, err := src.NewMigrator(ctx, dsn)
 	if err != nil {
 		return fmt.Errorf("construct %s migrator: %w", src.Name, err)
 	}
@@ -232,8 +233,9 @@ func newUpCmd() *cobra.Command {
 				}
 			}
 
+			ctx := cmd.Context()
 			for _, src := range srcs {
-				mg, err := src.NewMigrator(dsn)
+				mg, err := src.NewMigrator(ctx, dsn)
 				if err != nil {
 					rollbackPriors(snaps)
 					return fmt.Errorf("construct %s migrator: %w", src.Name, err)
@@ -294,7 +296,7 @@ func newDownCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return withSourceMigrator(src, dsn, func(mg *migrate.Migrate) error {
+			return withSourceMigrator(cmd.Context(), src, dsn, func(mg *migrate.Migrate) error {
 				if err := mg.Steps(-n); err != nil {
 					if errors.Is(err, migrate.ErrNoChange) {
 						fmt.Fprintln(cmd.OutOrStdout(), "no migrations to roll back")
@@ -336,6 +338,12 @@ func newStatusCmd() *cobra.Command {
 			}
 			lines := make([]lineRow, 0, len(srcs))
 			appliedTotal, pendingTotal := 0, 0
+			// Multi-source binaries surface a per-source desync line
+			// on stdout (see the breakdown loop below). Single-source
+			// binaries don't print that breakdown, so the stderr
+			// warning is their only signal — emit only when there's
+			// no stdout breakdown that would carry it.
+			multiSource := len(srcs) > 1
 			for _, src := range srcs {
 				total, err := countSourceFiles(src)
 				if err != nil {
@@ -343,7 +351,7 @@ func newStatusCmd() *cobra.Command {
 				}
 				var applied, dbVersion int
 				var downgraded bool
-				if rerr := withSourceMigrator(src, dsn, func(mg *migrate.Migrate) error {
+				if rerr := withSourceMigrator(cmd.Context(), src, dsn, func(mg *migrate.Migrate) error {
 					v, err := readVersion(mg)
 					if err != nil {
 						return err
@@ -356,9 +364,11 @@ func newStatusCmd() *cobra.Command {
 						// build. Warn but don't fail; the operator
 						// should reconcile by upgrading the binary.
 						downgraded = true
-						fmt.Fprintf(os.Stderr,
-							"warning: %s reports version %d but this binary only ships migrations up to %d (older binary against newer DB?)\n",
-							src.Name, v, total)
+						if !multiSource {
+							fmt.Fprintf(os.Stderr,
+								"warning: %s reports version %d but this binary only ships migrations up to %d (older binary against newer DB?)\n",
+								src.Name, v, total)
+						}
 					}
 					applied = min(dbVersion, total)
 					return nil
@@ -423,7 +433,7 @@ single track.`,
 			}
 			out := cmd.OutOrStdout()
 			if len(srcs) == 1 {
-				return withSourceMigrator(srcs[0], dsn, func(mg *migrate.Migrate) error {
+				return withSourceMigrator(cmd.Context(), srcs[0], dsn, func(mg *migrate.Migrate) error {
 					v, err := readVersion(mg)
 					if err != nil {
 						return err
@@ -433,7 +443,7 @@ single track.`,
 				})
 			}
 			for _, src := range srcs {
-				if err := withSourceMigrator(src, dsn, func(mg *migrate.Migrate) error {
+				if err := withSourceMigrator(cmd.Context(), src, dsn, func(mg *migrate.Migrate) error {
 					v, err := readVersion(mg)
 					if err != nil {
 						return err
@@ -470,7 +480,7 @@ the source is rolled back.`,
 			if err != nil {
 				return err
 			}
-			return withSourceMigrator(src, dsn, func(mg *migrate.Migrate) error {
+			return withSourceMigrator(cmd.Context(), src, dsn, func(mg *migrate.Migrate) error {
 				if v == 0 {
 					if err := mg.Down(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 						return err
@@ -513,7 +523,7 @@ failure message.`,
 			if err != nil {
 				return err
 			}
-			return withSourceMigrator(src, dsn, func(mg *migrate.Migrate) error {
+			return withSourceMigrator(cmd.Context(), src, dsn, func(mg *migrate.Migrate) error {
 				if err := mg.Force(v); err != nil {
 					return err
 				}

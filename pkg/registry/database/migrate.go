@@ -4,6 +4,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -24,7 +25,12 @@ import (
 // the underlying *sql.DB. A single dedicated connection (not a pool)
 // is used because go-migrate's advisory lock is session-level and must
 // not be shared.
-func NewMigrator(dsn string, migrationsFS fs.FS, dir, table string) (*migrate.Migrate, error) {
+//
+// NewMigrator takes a context for symmetry with the surrounding
+// startup code, but go-migrate's API is synchronous and doesn't accept
+// a context after construction — ctx is only consulted at open time
+// via sql.Conn pinging through the driver's default behavior.
+func NewMigrator(_ context.Context, dsn string, migrationsFS fs.FS, dir, table string) (*migrate.Migrate, error) {
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -140,8 +146,12 @@ func RollbackToVersion(mg *migrate.Migrate, name string, targetVersion uint) err
 			return fmt.Errorf("clear dirty state for %s: %w", name, err)
 		}
 		if forceTarget < 0 {
+			// First migration failed; the row is gone, nothing
+			// further to step back through.
 			return nil
 		}
+		// forceTarget >= 1 here, so cleanVersion >= 1 too — the
+		// signed→unsigned cast is well-defined.
 		currentVersion = uint(cleanVersion)
 	}
 

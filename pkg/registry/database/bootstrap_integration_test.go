@@ -131,7 +131,7 @@ func TestIntegration_BootstrapPreservesLegacyOSSRows(t *testing.T) {
 	}
 
 	// Run the bootstrap + go-migrate Up via the OSS factory.
-	mg, err := v1alpha1store.NewOSSMigrator(dsn)
+	mg, err := v1alpha1store.NewOSSMigrator(ctx, dsn)
 	require.NoError(t, err)
 	_, err = database.RunUpWithRecovery(mg, "oss")
 	require.NoError(t, err)
@@ -186,7 +186,7 @@ func TestIntegration_BootstrapPreservesLegacyOSSRows(t *testing.T) {
 	// call Up again; legacy table must still exist with the same row
 	// count, no new schema_migrations_v0_legacy_* duplicate, no
 	// duplicated rows in schema_migrations.
-	mg2, err := v1alpha1store.NewOSSMigrator(dsn)
+	mg2, err := v1alpha1store.NewOSSMigrator(ctx, dsn)
 	require.NoError(t, err)
 	_, err = database.RunUpWithRecovery(mg2, "oss")
 	require.NoError(t, err)
@@ -223,7 +223,7 @@ func TestIntegration_BootstrapNoOpOnFreshDatabase(t *testing.T) {
 	dsn := newBootstrapTestDB(t)
 	ctx := context.Background()
 
-	mg, err := v1alpha1store.NewOSSMigrator(dsn)
+	mg, err := v1alpha1store.NewOSSMigrator(ctx, dsn)
 	require.NoError(t, err)
 	_, err = database.RunUpWithRecovery(mg, "oss")
 	require.NoError(t, err)

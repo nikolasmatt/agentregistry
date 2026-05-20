@@ -34,9 +34,13 @@ var MigrationFiles = v1alpha1MigrationFiles
 // no-op on fresh installs and already-bridged DBs) before
 // constructing the migrator so existing pre-engine-swap deployments
 // upgrade transparently. The caller owns mg.Close().
-func NewOSSMigrator(dsn string) (*migrate.Migrate, error) {
-	if err := database.BootstrapLegacyOSSMigrations(context.Background(), dsn, v1alpha1MigrationFiles, migrationsDir); err != nil {
+//
+// ctx applies to the bootstrap call — a server-startup deadline or
+// SIGTERM-driven cancel will interrupt a `pg_advisory_xact_lock`
+// wait. go-migrate's own API is synchronous from this point onward.
+func NewOSSMigrator(ctx context.Context, dsn string) (*migrate.Migrate, error) {
+	if err := database.BootstrapLegacyOSSMigrations(ctx, dsn, v1alpha1MigrationFiles, migrationsDir); err != nil {
 		return nil, fmt.Errorf("bootstrap legacy OSS migrations: %w", err)
 	}
-	return database.NewMigrator(dsn, v1alpha1MigrationFiles, migrationsDir, MigrationsTable)
+	return database.NewMigrator(ctx, dsn, v1alpha1MigrationFiles, migrationsDir, MigrationsTable)
 }

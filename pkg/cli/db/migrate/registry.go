@@ -10,6 +10,7 @@
 package migrate
 
 import (
+	"context"
 	"io/fs"
 	"sync"
 
@@ -26,8 +27,11 @@ type Source struct {
 	// NewMigrator constructs a fresh *migrate.Migrate bound to dsn.
 	// The CLI is responsible for calling mg.Close() after each call;
 	// each invocation gets its own dedicated DB connection because
-	// go-migrate's advisory lock is session-level.
-	NewMigrator func(dsn string) (*migrate.Migrate, error)
+	// go-migrate's advisory lock is session-level. ctx applies to
+	// any setup work (legacy bootstrap, advisory-lock acquisition);
+	// go-migrate's own API is synchronous from the returned handle
+	// onward.
+	NewMigrator func(ctx context.Context, dsn string) (*migrate.Migrate, error)
 
 	// Files is the embedded migration set. Exposed so the CLI can
 	// walk it for pending-count math without pgring at the *migrate.Migrate

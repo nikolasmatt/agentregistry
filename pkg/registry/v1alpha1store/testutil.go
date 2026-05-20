@@ -110,7 +110,7 @@ func ensureTemplate(ctx context.Context, adminConn *pgx.Conn) error {
 	templateURI := fmt.Sprintf(
 		"postgres://agentregistry:agentregistry@localhost:5432/%s?sslmode=disable",
 		v1alpha1TemplateDBName)
-	mg, err := NewOSSMigrator(templateURI)
+	mg, err := NewOSSMigrator(ctx, templateURI)
 	if err != nil {
 		return fmt.Errorf("construct template migrator: %w", err)
 	}

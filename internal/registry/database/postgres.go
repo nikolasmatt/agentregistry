@@ -61,7 +61,7 @@ func NewPostgreSQL(ctx context.Context, connectionURI string, authz auth.Authori
 		return &PostgreSQL{pool: pool, authz: authz}, nil
 	}
 
-	mg, err := v1alpha1store.NewOSSMigrator(connectionURI)
+	mg, err := v1alpha1store.NewOSSMigrator(ctx, connectionURI)
 	if err != nil {
 		return nil, fmt.Errorf("failed to construct v1alpha1 migrator: %w", err)
 	}
