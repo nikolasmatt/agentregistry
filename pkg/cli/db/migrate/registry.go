@@ -13,10 +13,18 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"regexp"
 	"sync"
 
 	"github.com/golang-migrate/migrate/v4"
 )
+
+// sourceNameRE constrains Source.Name to Postgres-identifier-friendly
+// characters. Name flows into the per-source schema_migrations_<name>
+// table that go-migrate's MigrationsTable points at, so it must be a
+// valid SQL identifier; we tighten further to lowercase + digits +
+// underscore to keep operator-facing strings predictable.
+var sourceNameRE = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 // Source describes one set of migrations registered with the CLI.
 type Source struct {
@@ -52,16 +60,28 @@ var (
 // Register adds a migration source to the package registry. Intended
 // to be called from init() in the binary's root command package.
 //
+// Validates Name against ^[a-z][a-z0-9_]*$ — Name flows into the
+// schema_migrations_<name> bookkeeping table that go-migrate's
+// MigrationsTable points at, so it must be a valid SQL identifier.
+// Lowercase + digits + underscore keeps operator-facing strings
+// predictable across `--source` output and the breakdown lines that
+// `status` / `version` print.
+//
 // Panics on duplicate Name: each source's Name maps 1:1 to its
-// per-source schema_migrations_<name> table (via go-migrate's
-// per-instance MigrationsTable), so a duplicate Name would collide
-// at the bookkeeping layer. init-time panic fails fast at process
-// start where the misconfiguration is easy to spot.
+// per-source schema_migrations_<name> table, so a duplicate would
+// collide at the bookkeeping layer.
+//
+// Both checks panic rather than return an error because Register is
+// expected to fire from init() — failing fast at process start makes
+// the misconfiguration obvious.
 //
 // The mutex is defense-in-depth so a contract-violating caller
 // running Register outside init() doesn't trigger a silent data race
 // against Sources().
 func Register(s Source) {
+	if !sourceNameRE.MatchString(s.Name) {
+		panic(fmt.Sprintf("migrate.Register: source Name=%q must match %s (Name embeds into the schema_migrations_<name> bookkeeping table and must be a valid SQL identifier)", s.Name, sourceNameRE.String()))
+	}
 	sourcesMu.Lock()
 	defer sourcesMu.Unlock()
 	for _, existing := range sources {
