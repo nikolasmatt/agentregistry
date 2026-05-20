@@ -24,6 +24,15 @@ import (
 // table that go-migrate's MigrationsTable points at, so it must be a
 // valid SQL identifier; we tighten further to lowercase + digits +
 // underscore to keep operator-facing strings predictable.
+//
+// Pattern differs intentionally from
+// pkg/registry/database.identifierRE (`^[a-z_][a-z0-9_]*$`, allowing
+// a leading underscore for already-fully-formed table names like
+// `_legacy_table`). Source.Name is a suffix that gets concatenated
+// onto `schema_migrations_`, so requiring a leading letter here
+// keeps the resulting table name from looking like
+// `schema_migrations__foo` (double underscore is legal Postgres but
+// reads as a typo to operators).
 var sourceNameRE = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 // Source describes one set of migrations registered with the CLI.

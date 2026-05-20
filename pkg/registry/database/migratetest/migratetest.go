@@ -17,11 +17,18 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+// bridgedRowTableRE constrains the `table` argument to ReadBridgedRow.
+// Matches the production identifier rules in pkg/registry/database
+// so a typo at a test call site fails fast instead of compiling into
+// DDL that Postgres rejects with a hard-to-locate error.
+var bridgedRowTableRE = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
 
 // LegacyRow models one row of the pre-engine-swap custom-migrator
 // schema_migrations table. Version is the on-disk version under the
@@ -128,23 +135,32 @@ func LegacyRowName(t *testing.T, db *sql.DB, version int) string {
 	return name
 }
 
-// BridgedTable describes a single-row go-migrate schema_migrations
-// (or schema_migrations_<name>) snapshot. Returned by BridgedRow.
-type BridgedTable struct {
+// BridgedRow describes a single-row go-migrate schema_migrations
+// (or schema_migrations_<name>) snapshot. Returned by ReadBridgedRow.
+type BridgedRow struct {
 	Version int
 	Dirty   bool
 	Rows    int // total row count; should be 1 in steady state
 }
 
-// BridgedRow reads the (version, dirty) tuple plus row count from a
-// go-migrate-shaped schema_migrations table. Helper for asserting
-// that a bridge wrote exactly one row at the expected version.
-func BridgedRow(t *testing.T, db *sql.DB, table string) BridgedTable {
+// ReadBridgedRow reads the (version, dirty) tuple plus row count
+// from a go-migrate-shaped schema_migrations table. Helper for
+// asserting that a bridge wrote exactly one row at the expected
+// version.
+//
+// The `table` argument is interpolated into DDL via fmt.Sprintf, so
+// it's validated against the production identifier rules — a typo
+// fails the test loudly instead of producing a confusing Postgres
+// error.
+func ReadBridgedRow(t *testing.T, db *sql.DB, table string) BridgedRow {
 	t.Helper()
+	require.Truef(t, bridgedRowTableRE.MatchString(table),
+		"ReadBridgedRow: table=%q must match %s", table, bridgedRowTableRE.String())
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	var got BridgedTable
+	var got BridgedRow
 	err := db.QueryRowContext(ctx,
 		fmt.Sprintf(`SELECT version, dirty FROM %s`, table)).Scan(&got.Version, &got.Dirty)
 	require.NoErrorf(t, err, "read bridged row from %s", table)

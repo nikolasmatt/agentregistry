@@ -126,7 +126,7 @@ func TestIntegration_BootstrapPreservesLegacyOSSRows(t *testing.T) {
 	// the highest legacy OSS version (208) stripped of the +200
 	// offset (8). The orphan v205 is dropped because no .up.sql for
 	// version 5 exists in the embed.
-	bridged := migratetest.BridgedRow(t, db, "schema_migrations")
+	bridged := migratetest.ReadBridgedRow(t, db, "schema_migrations")
 	require.Equal(t, 8, bridged.Version, "highest legacy OSS row (208) bridged to v8")
 	require.False(t, bridged.Dirty, "bridged row must be clean")
 	require.Equal(t, 1, bridged.Rows, "go-migrate stores only the current version as a single row")
@@ -154,7 +154,7 @@ func TestIntegration_BootstrapPreservesLegacyOSSRows(t *testing.T) {
 	require.NoError(t, dbErr)
 
 	require.Equal(t, 8, migratetest.LegacyRowCount(t, db), "legacy table unchanged on re-run")
-	require.Equal(t, 1, migratetest.BridgedRow(t, db, "schema_migrations").Rows, "go-migrate row count unchanged on re-run")
+	require.Equal(t, 1, migratetest.ReadBridgedRow(t, db, "schema_migrations").Rows, "go-migrate row count unchanged on re-run")
 
 	// Assert no extra "legacy" copies were created (a second bridge
 	// pass would have errored on RENAME, so this is also implicit).

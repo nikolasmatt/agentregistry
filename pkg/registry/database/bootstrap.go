@@ -13,28 +13,41 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib" // pgx stdlib driver — required by sql.Open("pgx", ...)
 )
 
-// BootstrapAdvisoryLockKey is the pg_advisory_xact_lock key under
-// which BootstrapLegacyOSSMigrations serializes. ASCII "arboot-o"
-// packed into an int64 — stable, reproducible across processes.
+// BootstrapAdvisoryLockKey is the pg_advisory_xact_lock key used by
+// BootstrapLegacyOSSMigrations. ASCII "arboot-o" packed into an
+// int64 — stable, reproducible across processes.
 //
-// Downstream extensions running BootstrapLegacyTrack against the
-// renamed `schema_migrations_v0_legacy` table MUST pass this same
-// key as BootstrapLegacyTrackOptions.AdvisoryLockKey so all
-// bootstraps in the binary serialize globally against the OSS
-// rename. Concretely: in a rolling-deploy scenario with two server
-// pods, pod 1 might be running the OSS bootstrap (renaming
-// schema_migrations -> schema_migrations_v0_legacy) while pod 2 is
-// starting its downstream bootstrap (reading from
-// schema_migrations_v0_legacy). Without the shared lock, pod 2 sees
-// the old name and bails out as "nothing to bridge"; with the
-// shared lock, pod 2 waits for pod 1's COMMIT and observes the
-// renamed table.
+// All BootstrapLegacyTrack calls that pass this key serialize
+// against each other. This protects *same-track* racers: two pods
+// both running the OSS bootstrap at startup, or two pods both
+// running the same downstream bootstrap. The loser waits on the
+// winner's COMMIT, re-probes inside the lock, and observes the
+// bridged state cleanly instead of colliding on the RENAME.
 //
-// Downstream consumers that choose a different lock key for their
-// own reasons must instead poll for the renamed table's existence
-// with retry — this is materially more complex and is the documented
-// fallback, not the recommended path.
+// *Cross-track* ordering — e.g. a downstream bootstrap reading from
+// `schema_migrations_v0_legacy` only after the OSS bootstrap has
+// renamed the original `schema_migrations` to that name — is NOT
+// provided by the lock. The outside-lock pre-flight short-circuits
+// when the legacy input table doesn't yet exist and returns nil
+// without acquiring the lock at all. Consumers running multiple
+// tracks rely on the calling binary invoking them in dependency
+// order within a single startup (OSS bootstrap before downstream
+// bootstrap, in the same process); the shared lock is what makes
+// that ordering safe under concurrent pod startup.
+//
+// Downstream consumers that choose a different lock key get only
+// same-track protection against bootstraps using that key — they
+// do NOT serialize against bootstraps holding this key. Almost
+// always wrong; pass BootstrapAdvisoryLockKey unless you have a
+// concrete reason not to.
 const BootstrapAdvisoryLockKey = int64(0x6172626f6f742d6f)
+
+// maxIdentifierLen is Postgres's NAMEDATALEN (63 bytes for unquoted
+// identifiers). Names longer than this are truncated silently by
+// the catalog, which would let two distinct-config table names
+// sharing a 63-char prefix collide. validateBootstrapOptions caps
+// every identifier embedded into DDL at this length.
+const maxIdentifierLen = 63
 
 // identifierRE constrains the table-name strings BootstrapLegacyTrack
 // embeds into DDL. Init-time callers pass hardcoded values, so the
@@ -269,24 +282,43 @@ func BootstrapLegacyOSSMigrations(ctx context.Context, dsn string, migrationsFS 
 }
 
 // validateBootstrapOptions guards the table-name strings that get
-// embedded into DDL. Returns nil on a valid option struct.
+// embedded into DDL and rejects zero-value misconfigurations.
+// Returns nil on a valid option struct.
 func validateBootstrapOptions(opts BootstrapLegacyTrackOptions) error {
 	for label, name := range map[string]string{
 		"LegacyTable": opts.LegacyTable,
 		"NewTable":    opts.NewTable,
 	} {
-		if !identifierRE.MatchString(name) {
-			return fmt.Errorf("bootstrap option %s=%q must match %s", label, name, identifierRE.String())
+		if err := validateIdentifier(label, name); err != nil {
+			return err
 		}
 	}
-	if opts.RenameLegacyTo != "" && !identifierRE.MatchString(opts.RenameLegacyTo) {
-		return fmt.Errorf("bootstrap option RenameLegacyTo=%q must match %s", opts.RenameLegacyTo, identifierRE.String())
+	if opts.RenameLegacyTo != "" {
+		if err := validateIdentifier("RenameLegacyTo", opts.RenameLegacyTo); err != nil {
+			return err
+		}
+	}
+	if opts.LegacyVersionRange == ([2]int{0, 0}) {
+		return fmt.Errorf("bootstrap option LegacyVersionRange is required and must be a non-zero range (e.g. [201, 499])")
 	}
 	if opts.LegacyVersionRange[0] > opts.LegacyVersionRange[1] {
-		return fmt.Errorf("bootstrap option LegacyVersionRange=[%d, %d] must be non-empty", opts.LegacyVersionRange[0], opts.LegacyVersionRange[1])
+		return fmt.Errorf("bootstrap option LegacyVersionRange=[%d, %d] must be non-empty (lo <= hi)", opts.LegacyVersionRange[0], opts.LegacyVersionRange[1])
 	}
 	if opts.AdvisoryLockKey == 0 {
 		return fmt.Errorf("bootstrap option AdvisoryLockKey must be non-zero (pass database.BootstrapAdvisoryLockKey to serialize against the OSS bridge)")
+	}
+	return nil
+}
+
+// validateIdentifier rejects table-name strings that don't match
+// Postgres's unquoted-identifier rules (regex) or that would be
+// silently truncated by the catalog (length).
+func validateIdentifier(label, name string) error {
+	if !identifierRE.MatchString(name) {
+		return fmt.Errorf("bootstrap option %s=%q must match %s", label, name, identifierRE.String())
+	}
+	if len(name) > maxIdentifierLen {
+		return fmt.Errorf("bootstrap option %s=%q exceeds Postgres's %d-character identifier limit (NAMEDATALEN)", label, name, maxIdentifierLen)
 	}
 	return nil
 }
