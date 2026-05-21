@@ -13,33 +13,13 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib" // pgx stdlib driver — required by sql.Open("pgx", ...)
 )
 
-// BootstrapAdvisoryLockKey is the pg_advisory_xact_lock key used by
-// BootstrapLegacyOSSMigrations. ASCII "arboot-o" packed into an
-// int64 — stable, reproducible across processes.
-//
-// All BootstrapLegacyTrack calls that pass this key serialize
-// against each other. This protects *same-track* racers: two pods
-// both running the OSS bootstrap at startup, or two pods both
-// running the same downstream bootstrap. The loser waits on the
-// winner's COMMIT, re-probes inside the lock, and observes the
-// bridged state cleanly instead of colliding on the RENAME.
-//
-// *Cross-track* ordering — e.g. a downstream bootstrap reading from
-// `schema_migrations_v0_legacy` only after the OSS bootstrap has
-// renamed the original `schema_migrations` to that name — is NOT
-// provided by the lock. The outside-lock pre-flight short-circuits
-// when the legacy input table doesn't yet exist and returns nil
-// without acquiring the lock at all. Consumers running multiple
-// tracks rely on the calling binary invoking them in dependency
-// order within a single startup (OSS bootstrap before downstream
-// bootstrap, in the same process); the shared lock is what makes
-// that ordering safe under concurrent pod startup.
-//
-// Downstream consumers that choose a different lock key get only
-// same-track protection against bootstraps using that key — they
-// do NOT serialize against bootstraps holding this key. Almost
-// always wrong; pass BootstrapAdvisoryLockKey unless you have a
-// concrete reason not to.
+// BootstrapAdvisoryLockKey is the shared pg_advisory_xact_lock key
+// for BootstrapLegacyTrack callers. ASCII "arboot-o" packed into an
+// int64 — stable, reproducible across processes. See
+// BootstrapLegacyTrack's "Concurrency model" for what this lock
+// protects. Almost always the right value to pass; choose a
+// different key only with explicit cross-process serialization
+// reasoning.
 const BootstrapAdvisoryLockKey = int64(0x6172626f6f742d6f)
 
 // maxIdentifierLen is Postgres's NAMEDATALEN (63 bytes for unquoted
@@ -121,6 +101,24 @@ type BootstrapLegacyTrackOptions struct {
 // go-migrate's table shape. Idempotent and concurrent-safe — see
 // BootstrapLegacyOSSMigrations's docstring for the operator-facing
 // guarantees this provides.
+//
+// Concurrency model: callers passing the same AdvisoryLockKey
+// serialize against each other. The lock protects *same-track*
+// racers (two pods both running the OSS bootstrap; two pods both
+// running the same downstream bootstrap) — the loser waits on the
+// winner's COMMIT and re-probes inside the lock. *Cross-track*
+// ordering (downstream reading the table OSS just renamed) is NOT
+// provided by the lock; the outside-lock pre-flight short-circuits
+// when the legacy input table doesn't yet exist and returns nil
+// without acquiring the lock.
+//
+// Recommendation: avoid cross-track coordination entirely. Invoke
+// every bootstrap in the same process startup in dependency order
+// (OSS bootstrap before any downstream bootstrap reading from the
+// post-rename table). Pass the same AdvisoryLockKey so the
+// within-process ordering is safe under concurrent pod startup.
+// Do not rely on cross-process synchronization between different
+// tracks; that path is not supported.
 //
 // The algorithm:
 //

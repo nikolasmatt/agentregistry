@@ -84,9 +84,16 @@ of server startup. Reads ` + dbURLEnv + ` from the environment when
 // — practically, near the end of the downstream binary's `init()`
 // or early in its main(), once both the OSS and downstream sources
 // have registered themselves.
+//
+// Idempotent: repeat calls after the flag is already wired no-op.
+// Tests and downstream init() that may run more than once in the
+// same process are safe.
 func EnableSourceSelection() {
 	if migrateCmd == nil {
 		panic("migrate.EnableSourceSelection: called before NewCommand")
+	}
+	if migrateCmd.PersistentFlags().Lookup(sourceFlag) != nil {
+		return
 	}
 	migrateCmd.PersistentFlags().StringVar(&flags.source, sourceFlag, "",
 		"Migration source name (required for per-source ops when more than one source is registered)")
@@ -243,6 +250,11 @@ func newUpCmd() *cobra.Command {
 		Short: "Apply all pending migrations across every registered source",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// The --source flag is only registered when a downstream
+			// binary calls EnableSourceSelection; in OSS-only builds
+			// flags.source is always "" and this check is dead. Keep
+			// it so the rejection fires correctly in multi-source
+			// binaries.
 			if flags.source != "" {
 				return errors.New("up aggregates across all registered sources; --source is not applicable")
 			}
@@ -368,6 +380,9 @@ func newStatusCmd() *cobra.Command {
 		Short: "Show how many migrations are applied vs pending across all sources",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// Dead in OSS-only — flag is unregistered, value stays ""
+			// — but live once EnableSourceSelection wires --source for
+			// a downstream multi-source build. See newUpCmd.
 			if flags.source != "" {
 				return errors.New("status aggregates across all registered sources; --source is not applicable")
 			}
@@ -522,8 +537,8 @@ func newVersionCmd() *cobra.Command {
 		Short: "Print the highest applied migration version",
 		Long: `Print the highest applied migration version.
 For a single registered source the value is on one line; multi-source
-binaries print one line per source. Pass --source to filter to a
-single track.`,
+binaries print one line per source. When multiple sources are
+registered, --source filters to a single track.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			dsn, err := resolveDSN()

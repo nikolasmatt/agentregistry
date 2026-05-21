@@ -40,7 +40,5 @@ downstream needs to mutate the flag's value (use an option struct on
 
 ### Call order
 
-1. `NewCommand()`
-2. `Register(...)` any additional resources
-3. `Enable<Capability>()`
-4. Hand the assembled tree to cobra.
+Each `Enable<Capability>()` documents its own preconditions inline;
+the general shape is `NewCommand` → `Register` → `Enable…`.

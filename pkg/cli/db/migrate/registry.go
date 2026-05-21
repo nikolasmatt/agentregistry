@@ -112,9 +112,11 @@ func Sources() []Source {
 	return out
 }
 
-// ResetForTesting clears the registry. Test-only.
+// ResetForTesting clears the source registry and the cached
+// migrate-parent reference. Test-only.
 func ResetForTesting() {
 	sourcesMu.Lock()
 	defer sourcesMu.Unlock()
 	sources = nil
+	migrateCmd = nil
 }
