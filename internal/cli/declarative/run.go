@@ -18,6 +18,7 @@ import (
 	"github.com/agentregistry-dev/agentregistry/internal/cli/buildconfig"
 	"github.com/agentregistry-dev/agentregistry/internal/cli/declarative/chat"
 	"github.com/agentregistry-dev/agentregistry/internal/cli/frameworks"
+	"github.com/agentregistry-dev/agentregistry/pkg/api/v1alpha1"
 )
 
 // RunCmd is the cobra command for "run".
@@ -126,6 +127,20 @@ func runProject(ctx context.Context, out io.Writer, projectDir string, extraEnv 
 			break
 		}
 	}
+
+	// A remote-only mcp.yaml (Spec.Remote set, Spec.Source unset) has
+	// nothing to docker-run locally. Fail fast before the framework-not-
+	// found error so users get the npx-inspector hint even when their
+	// arctl.yaml lists a framework the local registry doesn't know about.
+	remote, mcpName, perr := loadRemoteOnlyMCP(projectDir)
+	if perr != nil {
+		return perr
+	}
+	if remote != nil {
+		return fmt.Errorf("%s is a remote MCPServer at %s. Nothing to run locally. To inspect tools: npx -y @modelcontextprotocol/inspector --server-url %s",
+			mcpName, remote.URL, remote.URL)
+	}
+
 	if p == nil {
 		return fmt.Errorf("no framework for framework=%s language=%s", cfg.Framework, cfg.Language)
 	}
@@ -397,4 +412,22 @@ func mergeEnv(dotEnv map[string]string, overrides []string) []string {
 	}
 	out = append(out, overrides...)
 	return out
+}
+
+// loadRemoteOnlyMCP returns (Remote, name) when projectDir's mcp.yaml has
+// Spec.Remote set and Spec.Source unset — the case where arctl run has no
+// local image to spawn. Returns (nil, ...) for source-mode or no-mcp.yaml
+// so callers fall through to the normal run flow.
+func loadRemoteOnlyMCP(projectDir string) (*v1alpha1.MCPRemote, string, error) {
+	doc, err := readMCPYAML(projectDir)
+	if err != nil {
+		return nil, "", err
+	}
+	if doc == nil {
+		return nil, "", nil
+	}
+	if doc.Spec.Remote != nil && doc.Spec.Source == nil {
+		return doc.Spec.Remote, doc.Metadata.Name, nil
+	}
+	return nil, doc.Metadata.Name, nil
 }
