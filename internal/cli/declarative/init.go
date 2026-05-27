@@ -654,6 +654,9 @@ Picks a framework + language interactively (or via --framework / --language).`,
 		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if initPort < 1 || initPort > 65535 {
+				return fmt.Errorf("--port must be between 1 and 65535, got %d", initPort)
+			}
 			var full string
 			if len(args) == 1 {
 				full = args[0]
@@ -731,7 +734,7 @@ Picks a framework + language interactively (or via --framework / --language).`,
 					return fmt.Errorf("update .gitignore: %w", err)
 				}
 			}
-			if err := writeDeclarativeMCPYAML(projectDir, full, image, initDescription); err != nil {
+			if err := writeDeclarativeMCPYAML(projectDir, full, image, initDescription, initPort); err != nil {
 				return err
 			}
 
@@ -785,7 +788,7 @@ func mcpTemplateVars(name, baseName, description, image, frameworkDir, projectDi
 	}
 }
 
-func writeDeclarativeMCPYAML(projectDir, name, image, description string) error {
+func writeDeclarativeMCPYAML(projectDir, name, image, description string, port int) error {
 	nameParts := strings.SplitN(name, "/", 2)
 	shortName := nameParts[len(nameParts)-1]
 
@@ -794,6 +797,11 @@ func writeDeclarativeMCPYAML(projectDir, name, image, description string) error 
 		desc = fmt.Sprintf("%s MCP server", shortName)
 	}
 
+	// Declare the transport that matches the scaffolded server: arctl init's
+	// fastmcp template serves Streamable HTTP on the chosen --port at /mcp
+	// (the same port `arctl run` maps and the deploy path wires to the
+	// Service + container). Generating it here means the manifest is
+	// deployable as-is — no manual transport/port edit before apply.
 	server := v1alpha1.MCPServer{
 		TypeMeta: v1alpha1.TypeMeta{
 			APIVersion: scheme.APIVersion,
@@ -809,7 +817,11 @@ func writeDeclarativeMCPYAML(projectDir, name, image, description string) error 
 				Package: &v1alpha1.MCPPackage{
 					RegistryType: "oci",
 					Identifier:   image,
-					Transport:    v1alpha1.MCPTransport{Type: "stdio"},
+					Transport: v1alpha1.MCPTransport{
+						Type: "http",
+						Port: uint16(port),
+						Path: "/mcp",
+					},
 				},
 			},
 		},
