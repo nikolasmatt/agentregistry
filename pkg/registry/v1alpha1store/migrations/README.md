@@ -1,10 +1,32 @@
 # OSS migration set
 
-This directory holds the v1alpha1 Postgres migrations applied by both
-the server (at startup, unless `SkipMigrations` is set) and the
-`arctl db migrate` CLI. The migrator is `golang-migrate/migrate v4`
-with the `pgx/v5` driver and the `iofs` source — see
+This directory holds the OSS Postgres migrations applied by both the
+server (at startup, unless `SkipMigrations` is set) and the `arctl db
+migrate` CLI. The migrator is `golang-migrate/migrate v4` with the
+`pgx/v5` driver and the `iofs` source — see
 `pkg/registry/database/migrate.go`.
+
+The current set is a single consolidated migration
+(`001_initial_schema`) representing the post-#503 baseline schema. Any
+new schema change is a new `NNN_*.up.sql` / `.down.sql` pair stacked
+on top.
+
+## Schema-agnostic discipline (enforced by lint test)
+
+Migrations must NOT reference a Postgres schema by name. The runtime
+schema is set via `migratepgx.Config{SchemaName: ...}` and resolved
+through `search_path`. Authors:
+
+- Use unqualified identifiers everywhere (`CREATE TABLE agents`, not
+  `CREATE TABLE agentregistry.agents`).
+- Do **not** include `CREATE SCHEMA` — the orchestrator creates the
+  source's schema before the migration runs.
+- Do **not** include `SET search_path` — the driver sets it.
+- Cross-schema references in migrations are not allowed.
+
+`pkg/registry/v1alpha1store/migrations_lint_test.go` walks the embed
+on every `go test ./...` and rejects any of those patterns with a
+`filename:line` pointer.
 
 ## File-naming convention
 
@@ -32,15 +54,11 @@ migrations are not atomic by default.
 
 The auto-recovery wrapper in `pkg/registry/database/migrate.go`
 clears go-migrate's dirty-state bookkeeping (`Force(current-1)`) so a
-partial-failure Up surfaces as an actionable error instead of
-`Dirty database version N. Fix and force version.`. **This is
-bookkeeping recovery only — it does not undo any DDL that committed
-before the migration failed.** Author every migration with
-idempotent DDL so a retry of the partially-applied migration is
-safe:
-
-Write idempotent DDL whenever the operation has a natural idempotent
-form, so a retry after partial failure is safe:
+partial-failure Up surfaces as an actionable error instead of `Dirty
+database version N. Fix and force version.`. **This is bookkeeping
+recovery only — it does not undo any DDL that committed before the
+migration failed.** Author every migration with idempotent DDL so a
+retry of the partially-applied migration is safe:
 
 | Use | Instead of |
 |---|---|
@@ -48,13 +66,14 @@ form, so a retry after partial failure is safe:
 | `CREATE INDEX IF NOT EXISTS ...` | `CREATE INDEX ...` |
 | `ALTER TABLE ... ADD COLUMN IF NOT EXISTS ...` | `ALTER TABLE ... ADD COLUMN ...` |
 | `CREATE OR REPLACE FUNCTION ...` | `CREATE FUNCTION ...` |
+| `CREATE OR REPLACE TRIGGER ...` | `CREATE TRIGGER ...` (Postgres 14+) |
 | `DROP TABLE IF EXISTS ...` | `DROP TABLE ...` |
 
 ## Reverse migrations
 
 `NNN_short_name.down.sql` is the inverse. The iofs source requires the
-file to exist (the pair is the unit of work); it does not run the
-file unless an operator invokes `arctl db migrate down` or backward
+file to exist (the pair is the unit of work); it does not run the file
+unless an operator invokes `arctl db migrate down` or a backward
 `goto`.
 
 - **Reversible migrations** — ship the inverse:
@@ -72,41 +91,12 @@ file unless an operator invokes `arctl db migrate down` or backward
     RAISE EXCEPTION 'migration NNN_<name> is not reversible (up-only)';
   END $$;
   ```
-  All migrations predating the convention switch (001/002/003/004/006/007/008)
-  ship with this raise-exception form.
-
-## Quick examples
-
-A simple forward + reverse pair:
-
-```
-NNN_widget_owner_index.up.sql:
-  CREATE INDEX IF NOT EXISTS widget_owner_idx ON widget (owner);
-
-NNN_widget_owner_index.down.sql:
-  DROP INDEX IF EXISTS widget_owner_idx;
-```
-
-A column add:
-
-```
-NNN_widget_archived.up.sql:
-  ALTER TABLE widget ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;
-
-NNN_widget_archived.down.sql:
-  ALTER TABLE widget DROP COLUMN IF EXISTS archived;
-```
+  `001_initial_schema` ships with this form (the consolidated baseline
+  is not reversible — operators wishing to start over drop the
+  database).
 
 ## Testing
 
-Integration tests for the migrator live in
-`pkg/registry/database/migrate_integration_test.go` (build tag
-`integration`). They use the `testdata/integration_*` fixture
-directories rather than this OSS set — the fixtures stay small and
-focused on migrator behavior, not v1alpha1 semantics.
-
-Run them via:
-
-```
-make test    # runs the full suite; the integration cases need Postgres at localhost:5432
-```
+The lint test runs in every `go test ./...` and is the first gate any
+new migration must pass. Schema-and-data integration coverage lives
+under `pkg/registry/database/integration/` with `//go:build integration`.
