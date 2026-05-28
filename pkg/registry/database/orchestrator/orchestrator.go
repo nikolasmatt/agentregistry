@@ -75,9 +75,13 @@ type Source struct {
 	Dir string
 
 	// LegacyRun, when non-nil, is invoked between `mg.Steps(1)` and
-	// `mg.Up()` — but only when `public.schema_migrations` exists AND
-	// the source's `schema_migrations` table was empty before
-	// `Steps(1)`. Fresh installs and re-runs both skip cleanly.
+	// `mg.Up()` whenever `public.schema_migrations` exists. The
+	// callback must be idempotent under re-invocation: on a successful
+	// run the orchestrator renames `public.schema_migrations` aside,
+	// which closes the gate naturally on subsequent runs, but the
+	// gate also fires on the recovery path after a partial run that
+	// committed `Steps(1)` and aborted before this callback ran. Fresh
+	// installs (no `public.schema_migrations` ever) skip cleanly.
 	LegacyRun func(ctx context.Context, db *sql.DB) error
 }
 
@@ -118,9 +122,12 @@ func RunUp(ctx context.Context, dsn string, sources []Source) error {
 //  3. Snapshot the row count of `<src.Schema>.schema_migrations`
 //     (zero if the table doesn't yet exist).
 //  4. Build `*migrate.Migrate` against `src.Schema`.
-//  5. `mg.Steps(1)`.
-//  6. If `src.LegacyRun != nil` AND `public.schema_migrations` exists
-//     AND the pre-Steps row count was zero, invoke `src.LegacyRun`.
+//  5. `mg.Steps(1)` (skipped if the pre-snapshot was non-zero — the
+//     row points at the already-applied first migration).
+//  6. If `src.LegacyRun != nil` AND `public.schema_migrations` exists,
+//     invoke `src.LegacyRun`. The pre-Steps row count is intentionally
+//     not part of this gate so the bridge fires on the recovery path
+//     after a partial run that committed `Steps(1)` and aborted.
 //  7. `mg.Up()`.
 //  8. Close mg + db (releases advisory lock).
 //

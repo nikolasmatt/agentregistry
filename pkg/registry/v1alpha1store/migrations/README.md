@@ -101,3 +101,31 @@ unless an operator invokes `arctl db migrate down` or a backward
 The lint test runs in every `go test ./...` and is the first gate any
 new migration must pass. Schema-and-data integration coverage lives
 under `pkg/registry/database/integration/` with `//go:build integration`.
+
+## Downgrade is not supported once the bridge has fired
+
+The first boot of an engine-swap binary against a pre-engine-swap
+database fires the legacy bridge: rows are copied from `v1alpha1.*`
+into the orchestrator-owned schema (default `agentregistry`),
+`public.schema_migrations` is renamed to
+`public.schema_migrations_v0_legacy`, and all subsequent app writes
+go to the new schema. The `v1alpha1.*` tables are left in place but
+become frozen — nothing updates them after the bridge.
+
+Rolling back to a pre-engine-swap binary at this point is not
+supported. The old binary would read and write the frozen
+`v1alpha1.*` tables, silently regressing the application's view of
+the data to the pre-bridge snapshot. Any rows written after the
+bridge would be invisible to the downgraded binary. The failure mode
+is silent, not loud — operators don't get an error; they get stale
+data.
+
+A follow-up release will ship a regular migration that drops the
+`v1alpha1.*` residue tables. After that release the downgrade
+constraint becomes a physical impossibility (the rollback target no
+longer exists) rather than a documented one. Until then the rollback
+target exists but is stale; the constraint is load-bearing during
+the lifetime of this release.
+
+Operators who need a true rollback path must restore the database
+from a backup taken before the engine-swap binary was deployed.
