@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -347,4 +348,149 @@ func firstLine(s string) string {
 		}
 	}
 	return s
+}
+
+// TestRunUp_RollsBackPriorSourcesOnLaterFailure exercises cross-source
+// atomicity: an already-upgraded earlier source is reversed to its
+// pre-run version when a later source fails, while its up-only floor is
+// left intact. track_a is brought to v1, then a run that would take it
+// to v2 fails on track_b — track_a must end back at v1 with 002's table
+// dropped.
+func TestRunUp_RollsBackPriorSourcesOnLaterFailure(t *testing.T) {
+	dsn := newDB(t)
+	ctx := context.Background()
+
+	upOnlyDown := []byte("DO $$ BEGIN RAISE EXCEPTION 'up-only'; END $$;")
+	a001 := fstest.MapFS{
+		"m/001_init.up.sql":   {Data: []byte("CREATE TABLE IF NOT EXISTS a_t (id int);")},
+		"m/001_init.down.sql": {Data: upOnlyDown},
+	}
+	aFull := fstest.MapFS{
+		"m/001_init.up.sql":   {Data: []byte("CREATE TABLE IF NOT EXISTS a_t (id int);")},
+		"m/001_init.down.sql": {Data: upOnlyDown},
+		"m/002_add.up.sql":    {Data: []byte("CREATE TABLE IF NOT EXISTS a_t2 (id int);")},
+		"m/002_add.down.sql":  {Data: []byte("DROP TABLE IF EXISTS a_t2;")},
+	}
+	bFail := fstest.MapFS{
+		"m/001_init.up.sql":   {Data: []byte("SELECT 1/0;")}, // fails at apply time
+		"m/001_init.down.sql": {Data: upOnlyDown},
+	}
+
+	srcA001 := orchestrator.Source{Name: "track_a", Schema: "track_a", Files: a001, Dir: "m"}
+	srcAFull := orchestrator.Source{Name: "track_a", Schema: "track_a", Files: aFull, Dir: "m"}
+	srcB := orchestrator.Source{Name: "track_b", Schema: "track_b", Files: bFail, Dir: "m"}
+
+	// Bring track_a to v1 — an existing source that the next run upgrades.
+	require.NoError(t, orchestrator.RunUp(ctx, dsn, []orchestrator.Source{srcA001}))
+
+	// track_a v1->v2, then track_b fails: track_a must roll back to v1.
+	err := orchestrator.RunUp(ctx, dsn, []orchestrator.Source{srcAFull, srcB})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "restored to their pre-run versions")
+
+	db, e := sql.Open("pgx", dsn)
+	require.NoError(t, e)
+	defer func() { _ = db.Close() }()
+
+	var version int
+	require.NoError(t, db.QueryRowContext(ctx,
+		"SELECT version FROM track_a.schema_migrations LIMIT 1").Scan(&version))
+	require.Equal(t, 1, version, "track_a must be rolled back to its pre-run version")
+
+	var hasA2 bool
+	require.NoError(t, db.QueryRowContext(ctx,
+		"SELECT to_regclass('track_a.a_t2') IS NOT NULL").Scan(&hasA2))
+	require.False(t, hasA2, "002's table must be dropped by the rollback down")
+
+	var hasA1 bool
+	require.NoError(t, db.QueryRowContext(ctx,
+		"SELECT to_regclass('track_a.a_t') IS NOT NULL").Scan(&hasA1))
+	require.True(t, hasA1, "the up-only 001 floor must remain (not reversed)")
+
+	// The failing source (freshly-installed, floor failed) must be reset
+	// so a re-run isn't blocked by a leftover dirty marker.
+	var bRows int
+	require.NoError(t, db.QueryRowContext(ctx,
+		"SELECT count(*) FROM track_b.schema_migrations").Scan(&bRows))
+	require.Equal(t, 0, bRows, "freshly-installed failing source must be reset to nil (no dirty marker left)")
+}
+
+// TestRunUp_RestoresUpgradedFailingSourceToEntry covers the key
+// intermediate-commit case: a source upgraded across MULTIPLE migrations
+// where a later one fails. The migrations that committed before the
+// failure must be reversed back to the entry version — not left applied,
+// and not over-rolled past the entry floor.
+func TestRunUp_RestoresUpgradedFailingSourceToEntry(t *testing.T) {
+	dsn := newDB(t)
+	ctx := context.Background()
+	upOnlyDown := []byte("DO $$ BEGIN RAISE EXCEPTION 'up-only'; END $$;")
+
+	v1 := fstest.MapFS{
+		"m/001_init.up.sql":   {Data: []byte("CREATE TABLE IF NOT EXISTS c_t (id int);")},
+		"m/001_init.down.sql": {Data: upOnlyDown},
+	}
+	// 002 commits, 003 fails: 002's table must be dropped, schema back at v1.
+	v3Fail := fstest.MapFS{
+		"m/001_init.up.sql":   {Data: []byte("CREATE TABLE IF NOT EXISTS c_t (id int);")},
+		"m/001_init.down.sql": {Data: upOnlyDown},
+		"m/002_add.up.sql":    {Data: []byte("CREATE TABLE IF NOT EXISTS c_t2 (id int);")},
+		"m/002_add.down.sql":  {Data: []byte("DROP TABLE IF EXISTS c_t2;")},
+		"m/003_bad.up.sql":    {Data: []byte("SELECT 1/0;")},
+		"m/003_bad.down.sql":  {Data: []byte("SELECT 1;")},
+	}
+
+	require.NoError(t, orchestrator.RunUp(ctx, dsn,
+		[]orchestrator.Source{{Name: "track_c", Schema: "track_c", Files: v1, Dir: "m"}}))
+
+	err := orchestrator.RunUp(ctx, dsn,
+		[]orchestrator.Source{{Name: "track_c", Schema: "track_c", Files: v3Fail, Dir: "m"}})
+	require.Error(t, err)
+
+	db, e := sql.Open("pgx", dsn)
+	require.NoError(t, e)
+	defer func() { _ = db.Close() }()
+
+	var version int
+	var dirty bool
+	require.NoError(t, db.QueryRowContext(ctx,
+		"SELECT version, dirty FROM track_c.schema_migrations LIMIT 1").Scan(&version, &dirty))
+	require.Equal(t, 1, version, "track_c must be restored to its entry version")
+	require.False(t, dirty, "dirty marker from the failed 003 must be cleared")
+
+	var hasC2 bool
+	require.NoError(t, db.QueryRowContext(ctx,
+		"SELECT to_regclass('track_c.c_t2') IS NOT NULL").Scan(&hasC2))
+	require.False(t, hasC2, "002's table (committed before the failure) must be reversed")
+
+	var hasC1 bool
+	require.NoError(t, db.QueryRowContext(ctx,
+		"SELECT to_regclass('track_c.c_t') IS NOT NULL").Scan(&hasC1))
+	require.True(t, hasC1, "the entry-version floor must remain")
+}
+
+// TestRunUp_RefusesSourceAlreadyDirty asserts a source found dirty at the
+// start of a run is not migrated; RunUp surfaces it for operator `force`
+// rather than guessing a restore target.
+func TestRunUp_RefusesSourceAlreadyDirty(t *testing.T) {
+	dsn := newDB(t)
+	ctx := context.Background()
+
+	v1 := fstest.MapFS{
+		"m/001_init.up.sql":   {Data: []byte("CREATE TABLE IF NOT EXISTS d_t (id int);")},
+		"m/001_init.down.sql": {Data: []byte("DROP TABLE IF EXISTS d_t;")},
+	}
+	src := orchestrator.Source{Name: "track_d", Schema: "track_d", Files: v1, Dir: "m"}
+	require.NoError(t, orchestrator.RunUp(ctx, dsn, []orchestrator.Source{src}))
+
+	// Manually mark the source dirty, simulating a prior crashed run.
+	db, e := sql.Open("pgx", dsn)
+	require.NoError(t, e)
+	defer func() { _ = db.Close() }()
+	_, err := db.ExecContext(ctx, "UPDATE track_d.schema_migrations SET dirty = true")
+	require.NoError(t, err)
+
+	err = orchestrator.RunUp(ctx, dsn, []orchestrator.Source{src})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "entered dirty")
+	require.Contains(t, err.Error(), "force")
 }

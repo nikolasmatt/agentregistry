@@ -64,19 +64,29 @@ NNN_short_name.down.sql      # reverse (required by the iofs source)
 
 ## Forward migrations
 
-`NNN_short_name.up.sql` is the schema change. **Do not wrap the file
-in `BEGIN;` / `COMMIT;`** — go-migrate runs the SQL through `Exec`,
-and Postgres autocommits single-statement DDL. Multi-statement
-migrations are not atomic by default.
+`NNN_short_name.up.sql` is the schema change. **Do not add explicit
+`BEGIN;` / `COMMIT;` / `START TRANSACTION`, and do not use
+`CONCURRENTLY`** (the lint test rejects both). The driver sends the
+whole file to Postgres in one `Exec` over the simple query protocol,
+which runs it as a **single implicit transaction**: every statement in
+the file commits together, or — if any statement fails — they all roll
+back together. Postgres DDL is transactional, so a failed migration
+leaves no half-applied schema. Adding explicit transaction control or a
+`CONCURRENTLY` statement breaks that single-transaction guarantee,
+which is why they are linted out (see "Atomicity invariant" below).
 
-A partially-applied migration leaves go-migrate's `schema_migrations`
-row marked dirty; subsequent `up` invocations refuse to run until the
-marker is cleared. The orchestrator does not auto-recover from the
-dirty state — operators clear it via `arctl db migrate force V`, where
-`V` is the version named in the failure message. **This is bookkeeping
-recovery only — it does not undo any DDL that committed before the
-migration failed.** Author every migration with idempotent DDL so a
-retry of the partially-applied migration is safe:
+Even though the DDL rolls back, a failed migration leaves go-migrate's
+`schema_migrations` row marked **dirty**: go-migrate commits the
+`(version, dirty=true)` marker in a *separate* transaction before
+running the migration body and only clears it after the body succeeds.
+So the state after a failure is *clean schema at the prior version +
+a dirty bookkeeping marker*. Subsequent `up` invocations refuse to run
+until the marker is cleared. On the normal CLI path operators clear it
+via `arctl db migrate force V`, where `V` is the version named in the
+failure message. (When the failure happens mid-`RunUp` the orchestrator
+clears the marker itself as part of restoring the source — see
+"Atomicity invariant".) Author every migration with idempotent DDL so a
+retry is safe regardless:
 
 | Use | Instead of |
 |---|---|
@@ -86,6 +96,27 @@ retry of the partially-applied migration is safe:
 | `CREATE OR REPLACE FUNCTION ...` | `CREATE FUNCTION ...` |
 | `CREATE OR REPLACE TRIGGER ...` | `CREATE TRIGGER ...` (Postgres 14+) |
 | `DROP TABLE IF EXISTS ...` | `DROP TABLE ...` |
+
+### Atomicity invariant (relied on by the orchestrator)
+
+When `RunUp` applies more than one source and a *later* source fails,
+the orchestrator restores every source it touched this run — including
+the failing one — back to the version it sat at before the run, so the
+database returns to the prior release's version combo rather than a
+cross-track state no release ships. For the failing source that means:
+clear the dirty marker, then run the `.down.sql` files for the
+migrations that committed this run, back down to the entry version.
+
+That restore is only safe because of the single-transaction property
+above: a failed migration's DDL has fully rolled back, so clearing the
+marker and replaying downs lands the schema exactly at the entry
+version. **A migration that breaks atomicity — explicit transaction
+control, or `CONCURRENTLY` — could leave half-applied DDL that the
+restore would then mismatch, silently corrupting the schema.** This is
+why the lint test rejects those constructs; the rejection is not
+stylistic. A source found *already* dirty at the start of a run is not
+restored at all — its true state is ambiguous, so `RunUp` surfaces it
+for `arctl db migrate force` instead of guessing.
 
 ## Reverse migrations
 

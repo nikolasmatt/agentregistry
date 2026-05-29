@@ -136,6 +136,33 @@ var forbiddenPatterns = []struct {
 		re:      regexp.MustCompile(`(?i)\bDROP\s+(?:TABLE|INDEX|TRIGGER|FUNCTION)(?:\s+IF\s+EXISTS)?\s+` + qualifiedIdent),
 		message: "DROP addressing a non-default schema is not allowed",
 	},
+	{
+		// CONCURRENTLY (CREATE/DROP INDEX, REINDEX) cannot run inside a
+		// transaction block. The driver wraps each migration file in one
+		// implicit transaction; a CONCURRENTLY statement would either error
+		// or, on its own, apply non-atomically — breaking the
+		// single-transaction invariant the orchestrator's failure-restore
+		// relies on (a failed file must roll back its DDL, leaving only a
+		// dirty marker, never half-applied schema).
+		re:      regexp.MustCompile(`(?i)\bCONCURRENTLY\b`),
+		message: "CONCURRENTLY is not allowed (it breaks the single-transaction atomicity the orchestrator's failure-restore depends on)",
+	},
+	{
+		// Explicit COMMIT/ROLLBACK ends the implicit transaction early, so
+		// statements after it apply non-atomically. Anchored to statement
+		// forms (`COMMIT;`, `COMMIT WORK`, end-of-line) so the words inside
+		// string literals or identifiers like `commit_sha` don't trip it.
+		re:      regexp.MustCompile(`(?i)\b(?:COMMIT|ROLLBACK)\b\s*(?:;|WORK\b|TRANSACTION\b|AND\b|$)`),
+		message: "explicit COMMIT/ROLLBACK is not allowed (it breaks the single-transaction atomicity the orchestrator's failure-restore depends on)",
+	},
+	{
+		// Explicit transaction openers. PL/pgSQL block `BEGIN` (as in
+		// `DO $$ BEGIN ... END $$`) is never written `BEGIN;` / `BEGIN
+		// TRANSACTION` / `BEGIN WORK`, so only the transaction-control forms
+		// match.
+		re:      regexp.MustCompile(`(?i)(?:\bSTART\s+TRANSACTION\b|\bBEGIN\s+TRANSACTION\b|\bBEGIN\s+WORK\b|\bBEGIN\s*;)`),
+		message: "explicit transaction control (BEGIN/START TRANSACTION) is not allowed (the driver wraps each migration file in one implicit transaction)",
+	},
 }
 
 // scanSQL applies the forbidden-pattern catalogue to a single file.
@@ -269,6 +296,26 @@ func TestMigrationsLint_FlagsForbiddenPatterns(t *testing.T) {
 			`INSERT INTO "other"."foo" (id) VALUES (1);`,
 			"INSERT INTO addressing a non-default schema",
 		},
+		{
+			"CREATE INDEX CONCURRENTLY (unqualified)",
+			"CREATE INDEX CONCURRENTLY foo_idx ON foo (id);",
+			"CONCURRENTLY is not allowed",
+		},
+		{
+			"explicit COMMIT",
+			"CREATE TABLE foo (id int);\nCOMMIT;",
+			"explicit COMMIT/ROLLBACK is not allowed",
+		},
+		{
+			"explicit BEGIN;",
+			"BEGIN;\nCREATE TABLE foo (id int);",
+			"explicit transaction control",
+		},
+		{
+			"explicit START TRANSACTION",
+			"START TRANSACTION;\nCREATE TABLE foo (id int);",
+			"explicit transaction control",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -290,6 +337,29 @@ func TestMigrationsLint_FlagsForbiddenPatterns(t *testing.T) {
 				t.Fatalf("expected violation containing %q; got %v", tc.want, violations)
 			}
 		})
+	}
+}
+
+// TestMigrationsLint_AllowsPlpgsqlBlocks confirms the transaction-control
+// rules don't false-positive on PL/pgSQL block syntax — `DO $$ BEGIN ...
+// END $$`, `END IF;`, and a trigger function body — none of which are
+// transaction control. The real `001` down file uses the DO/BEGIN/END
+// form.
+func TestMigrationsLint_AllowsPlpgsqlBlocks(t *testing.T) {
+	bodies := []string{
+		"DO $$ BEGIN\n  RAISE EXCEPTION 'not reversible';\nEND $$;",
+		"CREATE OR REPLACE FUNCTION notify_fn() RETURNS trigger AS $$\nBEGIN\n  PERFORM pg_notify('agents_status', NEW.id::text);\n  RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql;",
+		"DO $$ BEGIN\n  IF NOT EXISTS (SELECT 1) THEN\n    NULL;\n  END IF;\nEND $$;",
+		"INSERT INTO audit (action) VALUES ('commit');",
+		"CREATE TABLE foo (commit_sha text);",
+	}
+	for _, body := range bodies {
+		fixture := fstest.MapFS{
+			"migrations/999_test.up.sql": &fstest.MapFile{Data: []byte(body)},
+		}
+		if violations := lintMigrations(t, fixture, "migrations"); len(violations) != 0 {
+			t.Errorf("expected no violations for PL/pgSQL body %q; got %v", body, violations)
+		}
 	}
 }
 

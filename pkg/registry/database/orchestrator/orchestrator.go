@@ -48,6 +48,7 @@ import (
 	"log/slog"
 
 	"github.com/golang-migrate/migrate/v4"
+	migratedb "github.com/golang-migrate/migrate/v4/database"
 
 	"github.com/agentregistry-dev/agentregistry/pkg/registry/database"
 )
@@ -85,25 +86,114 @@ type Source struct {
 	LegacyRun func(ctx context.Context, db *sql.DB) error
 }
 
-// RunUp opens a dedicated single-connection database handle per Source,
-// acquires a per-source `pg_advisory_lock`, applies `Steps(1)`,
-// invokes the legacy bridge if applicable, then applies `Up()`. After
-// every Source succeeds, if at least one source's `LegacyRun` actually
-// fired this run, `public.schema_migrations` (the prior custom
-// migrator's bookkeeping table) is renamed to
-// `public.schema_migrations_v0_legacy`. The bridge-gate keeps RunUp
-// from touching an unrelated owner of the same well-known table name.
+// orchestratorGlobalLockKey is the advisory-lock key held for the whole
+// of RunUp so concurrent pods run the migrate sequence strictly one at a
+// time. It is a fixed literal — never derived from a Source name — so no
+// Source's per-source lock can ever collide with it.
+const orchestratorGlobalLockKey int64 = 0x6172_6f72_6368_6573 // "arorches"
+
+// RunUp serializes the entire migrate sequence behind a single global
+// advisory lock, then for each Source opens a dedicated single-connection
+// database handle, acquires a per-source `pg_advisory_lock`, applies
+// `Steps(1)`, invokes the legacy bridge if applicable, then applies
+// `Up()`. After every Source succeeds, if at least one source's
+// `LegacyRun` actually fired this run, `public.schema_migrations` (the
+// prior custom migrator's bookkeeping table) is renamed to
+// `public.schema_migrations_v0_legacy`. The bridge-gate keeps RunUp from
+// touching an unrelated owner of the same well-known table name.
 //
-// Concurrent invocations against the same database serialize through
-// the advisory lock; the loser re-probes inside the lock and falls
-// through to a no-op.
+// # Concurrency
+//
+// The global lock means only one pod is ever inside the source loop or
+// the failure-restore path at a time; losers block, then re-probe and
+// fall through to no-ops once they acquire it. This is what makes the
+// cross-source restore below safe: without it, one pod restoring a source
+// could clobber a version another pod legitimately advanced. The
+// per-source locks inside runSource/WithSourceLock are retained to
+// serialize RunUp against the CLI's per-source `down`/`goto`/`force`;
+// RunUp always takes the global lock before any per-source lock and the
+// CLI never takes the global lock, so there is no lock-ordering cycle.
+//
+// # Cross-source atomicity
+//
+// If any source fails, every source this run touched — the failing source
+// and all earlier-applied ones — is restored to the version it sat at
+// before RunUp started, so the database returns to the prior release's
+// version combo rather than a cross-track state no release ships (e.g.
+// OSS @ 6 + ENT @ 12 when the release is OSS @ 6 + ENT @ 13). This is a
+// compensating rollback, not a transaction: there is no single
+// transaction spanning the sources (each migrator owns its own
+// connection). It depends on two invariants:
+//
+//   - every incremental migration ships a real, idempotent `.down.sql`
+//     (see migrations/README.md), and
+//   - each migration file is applied as one implicit transaction, so a
+//     failed migration's DDL rolls back atomically and only a dirty
+//     bookkeeping marker is left behind — never half-applied schema (the
+//     lint test forbids `CONCURRENTLY` and explicit transaction control,
+//     which are the only ways to break that).
+//
+// Sources first-installed by this run are returned to NilVersion if they
+// carry a dirty marker (their up-only `001` floor is idempotent and
+// re-applies on a re-run) and otherwise left at their freshly-applied
+// floor; their floor cannot be reversed. A source found already dirty at
+// entry is not migrated at all: RunUp restores the prior sources and
+// surfaces the dirty source for operator `force` resolution, since its
+// true schema state is ambiguous.
 func RunUp(ctx context.Context, dsn string, sources []Source) error {
-	bridged := false
-	for _, src := range sources {
-		ran, err := runSource(ctx, dsn, src)
-		if err != nil {
-			return fmt.Errorf("run source %s: %w", src.Name, err)
+	globalDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return fmt.Errorf("open database for global lock: %w", err)
+	}
+	globalDB.SetMaxOpenConns(1)
+	defer func() { _ = globalDB.Close() }()
+	if _, err := globalDB.ExecContext(ctx, "SELECT pg_advisory_lock($1)", orchestratorGlobalLockKey); err != nil {
+		return fmt.Errorf("acquire global orchestrator lock: %w", err)
+	}
+	defer func() {
+		if _, err := globalDB.ExecContext(ctx, "SELECT pg_advisory_unlock($1)", orchestratorGlobalLockKey); err != nil {
+			slog.Default().Warn("release global orchestrator lock",
+				"component", "database.orchestrator", "error", err)
 		}
+	}()
+
+	bridged := false
+	var applied []appliedSource
+	for _, src := range sources {
+		// Snapshot the version this source sits at before we touch it, so
+		// a failure can restore it to exactly this point.
+		pre, dirty, present, err := preRunVersion(ctx, dsn, src.Schema)
+		if err != nil {
+			return errors.Join(
+				fmt.Errorf("snapshot pre-run version for source %s: %w", src.Name, err),
+				restoreAll(ctx, dsn, applied))
+		}
+		if dirty {
+			// The source entered this run dirty (a prior run left a marker
+			// whose schema state is ambiguous). Don't guess a restore
+			// target for it: roll the prior sources back and surface it for
+			// `arctl db migrate force`.
+			return errors.Join(
+				fmt.Errorf("source %s entered dirty at v%d; resolve with `arctl db migrate force` before migrating", src.Name, pre),
+				restoreAll(ctx, dsn, applied))
+		}
+
+		ran, runErr := runSource(ctx, dsn, src)
+		if runErr != nil {
+			// Restore the failing source and every prior applied source to
+			// their pre-run versions. The failing source is appended last
+			// so restoreAll reverses it first.
+			touched := append(append([]appliedSource{}, applied...),
+				appliedSource{src: src, preVersion: pre, present: present})
+			if rErr := restoreAll(ctx, dsn, touched); rErr != nil {
+				return errors.Join(
+					fmt.Errorf("run source %s failed: %w", src.Name, runErr),
+					fmt.Errorf("restoring sources to their pre-run versions also failed: %w", rErr))
+			}
+			return fmt.Errorf("run source %s failed; all sources restored to their pre-run versions: %w", src.Name, runErr)
+		}
+
+		applied = append(applied, appliedSource{src: src, preVersion: pre, present: present})
 		if ran {
 			bridged = true
 		}
@@ -112,6 +202,139 @@ func RunUp(ctx context.Context, dsn string, sources []Source) error {
 		return nil
 	}
 	return renameLegacyOnce(ctx, dsn)
+}
+
+// appliedSource records a source RunUp touched, with the version it sat
+// at beforehand — the target restoreSource returns it to on failure.
+type appliedSource struct {
+	src        Source
+	preVersion uint
+	present    bool // whether the source had a prior applied version at entry
+}
+
+// restoreAll restores the given sources to their pre-run versions in
+// reverse of slice order (most-recently-touched first). Per-source
+// errors are collected and joined rather than aborting on the first, so
+// one un-restorable source doesn't strand the others.
+func restoreAll(ctx context.Context, dsn string, sources []appliedSource) error {
+	var errs []error
+	for i := len(sources) - 1; i >= 0; i-- {
+		if err := restoreSource(ctx, dsn, sources[i]); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// restoreSource returns a single source to the version it sat at before
+// RunUp touched it. It is the one rollback primitive for both the failing
+// source (which may carry a dirty marker) and prior applied sources
+// (clean), under the source's advisory lock.
+//
+//   - A dirty marker (only the failing source can carry one — go-migrate
+//     commits the dirty flag before running a migration body that then
+//     rolled back atomically) is force-cleared first so Migrate can run.
+//   - A source first-installed this run (present == false) is reset to
+//     NilVersion if it still carries a marker — its up-only `001` floor is
+//     idempotent and re-applies on a re-run — and otherwise left at its
+//     freshly-applied floor. Its floor tables are left in place.
+//   - An upgraded source (present == true) is migrated back down to its
+//     entry version, running only the `.down.sql` files for the
+//     incremental migrations — never the up-only floor (entry >= 1).
+func restoreSource(ctx context.Context, dsn string, a appliedSource) error {
+	logger := slog.Default().With("component", "database.orchestrator", "source", a.src.Name)
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	defer func() { _ = db.Close() }()
+
+	lockKey := advisoryLockKey(a.src.Name)
+	if _, err := db.ExecContext(ctx, "SELECT pg_advisory_lock($1)", lockKey); err != nil {
+		return fmt.Errorf("acquire advisory lock for source %s: %w", a.src.Name, err)
+	}
+	defer func() {
+		if _, err := db.ExecContext(ctx, "SELECT pg_advisory_unlock($1)", lockKey); err != nil {
+			logger.Warn("release advisory lock", "error", err)
+		}
+	}()
+
+	mg, err := database.NewMigrator(ctx, dsn, a.src.Files, a.src.Dir, a.src.Schema)
+	if err != nil {
+		return fmt.Errorf("construct migrator for source %s: %w", a.src.Name, err)
+	}
+	defer func() { _, _ = mg.Close() }()
+
+	cur, dirty, verErr := mg.Version()
+	switch {
+	case errors.Is(verErr, migrate.ErrNilVersion):
+		// No marker at all — nothing to restore.
+		return nil
+	case verErr != nil:
+		return fmt.Errorf("read current version for source %s: %w", a.src.Name, verErr)
+	}
+
+	if dirty {
+		// The failed migration body rolled back atomically (see the
+		// single-transaction invariant in migrations/README.md), so cur's
+		// DDL is not present. Force the marker clean at cur so Migrate can
+		// run; the down to the entry version reverses the migrations that
+		// did commit this run.
+		if err := mg.Force(int(cur)); err != nil {
+			return fmt.Errorf("clear dirty marker for source %s at v%d: %w", a.src.Name, cur, err)
+		}
+	}
+
+	if !a.present {
+		if dirty {
+			if err := mg.Force(migratedb.NilVersion); err != nil {
+				return fmt.Errorf("reset freshly-installed source %s to nil: %w", a.src.Name, err)
+			}
+			logger.Info("reset freshly-installed failing source to nil (floor DDL is idempotent on re-run)")
+		}
+		return nil
+	}
+
+	logger.Info("restoring source to its pre-run version", "to_version", a.preVersion)
+	if err := mg.Migrate(a.preVersion); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		return fmt.Errorf("migrate source %s down to v%d: %w", a.src.Name, a.preVersion, err)
+	}
+	return nil
+}
+
+// preRunVersion reports the version `<schema>.schema_migrations` records,
+// whether that row is marked dirty, and whether any version is applied at
+// all. A missing table or empty bookkeeping means the source is being
+// first-installed (present == false).
+func preRunVersion(ctx context.Context, dsn, schema string) (version uint, dirty, present bool, err error) {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return 0, false, false, fmt.Errorf("open database: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var oid sql.NullString
+	if err := db.QueryRowContext(ctx,
+		"SELECT to_regclass($1)::text", schema+".schema_migrations").Scan(&oid); err != nil {
+		return 0, false, false, fmt.Errorf("probe %s.schema_migrations: %w", schema, err)
+	}
+	if !oid.Valid {
+		return 0, false, false, nil
+	}
+	var (
+		v uint64
+		d bool
+	)
+	// go-migrate keeps a single bookkeeping row (version, dirty).
+	switch err := db.QueryRowContext(ctx,
+		fmt.Sprintf("SELECT version, dirty FROM %s.schema_migrations LIMIT 1", schema)).Scan(&v, &d); {
+	case errors.Is(err, sql.ErrNoRows):
+		return 0, false, false, nil
+	case err != nil:
+		return 0, false, false, fmt.Errorf("read %s.schema_migrations version: %w", schema, err)
+	}
+	return uint(v), d, true, nil
 }
 
 // runSource executes the per-Source sequence:
