@@ -49,6 +49,7 @@ import (
 
 	"github.com/golang-migrate/migrate/v4"
 	migratedb "github.com/golang-migrate/migrate/v4/database"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/agentregistry-dev/agentregistry/pkg/registry/database"
 )
@@ -56,9 +57,10 @@ import (
 // Source describes one set of migrations to be applied as part of the
 // orchestrator's startup sequence.
 type Source struct {
-	// Name is the operator-visible label and the advisory-lock key
-	// derivation input. Must be a valid SQL identifier
-	// (`^[a-z][a-z0-9_]*$`).
+	// Name is the operator-visible label (shown in logs, accepted by the
+	// CLI's `--source` flag) and the input to the advisory-lock key hash.
+	// It is never interpolated into SQL, so it only needs to be a stable,
+	// unique-per-source token; keep it short and lowercase for readability.
 	Name string
 
 	// Schema is the Postgres schema this source's tables live in
@@ -94,55 +96,42 @@ const orchestratorGlobalLockKey int64 = 0x6172_6f72_6368_6573 // "arorches"
 
 // RunUp serializes the entire migrate sequence behind a single global
 // advisory lock, then for each Source opens a dedicated single-connection
-// database handle, acquires a per-source `pg_advisory_lock`, applies
-// `Steps(1)`, invokes the legacy bridge if applicable, then applies
-// `Up()`. After every Source succeeds, if at least one source's
-// `LegacyRun` actually fired this run, `public.schema_migrations` (the
-// prior custom migrator's bookkeeping table) is renamed to
-// `public.schema_migrations_v0_legacy`. The bridge-gate keeps RunUp from
-// touching an unrelated owner of the same well-known table name.
+// handle, acquires a per-source `pg_advisory_lock`, applies `Steps(1)`,
+// invokes the legacy bridge if applicable, then `Up()`. After every
+// Source succeeds, if at least one source's `LegacyRun` fired this run,
+// `public.schema_migrations` (the prior custom migrator's bookkeeping
+// table) is renamed to `public.schema_migrations_v0_legacy`. The
+// bridge-gate keeps RunUp from touching an unrelated owner of that table.
 //
 // # Concurrency
 //
 // The global lock means only one pod is ever inside the source loop or
-// the failure-restore path at a time; losers block, then re-probe and
-// fall through to no-ops once they acquire it. This is what makes the
-// cross-source restore below safe: without it, one pod restoring a source
-// could clobber a version another pod legitimately advanced. The
-// per-source locks inside runSource/WithSourceLock are retained to
-// serialize RunUp against the CLI's per-source `down`/`goto`/`force`;
-// RunUp always takes the global lock before any per-source lock and the
-// CLI never takes the global lock, so there is no lock-ordering cycle.
+// the failure-restore path; losers block, then re-probe and no-op once
+// they acquire it. This is what makes the cross-source restore safe —
+// otherwise one pod restoring a source could clobber a version another
+// pod legitimately advanced. The per-source locks (runSource /
+// WithSourceLock) are retained to serialize RunUp against the CLI's
+// `down`/`goto`/`force`; RunUp always takes the global lock first and the
+// CLI never takes it, so there is no lock-ordering cycle.
 //
 // # Cross-source atomicity
 //
-// If any source fails, every source this run touched — the failing source
-// and all earlier-applied ones — is restored to the version it sat at
-// before RunUp started, so the database returns to the prior release's
-// version combo rather than a cross-track state no release ships (e.g.
-// OSS @ 6 + ENT @ 12 when the release is OSS @ 6 + ENT @ 13). This is a
-// compensating rollback, not a transaction: there is no single
-// transaction spanning the sources (each migrator owns its own
-// connection). It depends on two invariants:
+// If any source fails, every source this run touched — the failing one
+// and all earlier-applied ones — is restored to its pre-run version, so
+// the database returns to the prior release's version combo instead of a
+// cross-track state no release ships. This is a compensating rollback,
+// not a transaction (each migrator owns its own connection), so it
+// depends on two invariants: every incremental migration ships a real,
+// idempotent `.down.sql`, and each migration file applies as one implicit
+// transaction (so a failed file's DDL rolls back atomically, leaving only
+// a dirty marker — never half-applied schema). The lint test enforces the
+// latter for the common cases; see migrations/README.md.
 //
-//   - every incremental migration ships a real, idempotent `.down.sql`
-//     (see migrations/README.md), and
-//   - each migration file is applied as one implicit transaction, so a
-//     failed migration's DDL rolls back atomically and only a dirty
-//     bookkeeping marker is left behind — never half-applied schema. The
-//     lint test rejects the constructs most likely to break that
-//     (`CONCURRENTLY`, explicit transaction control, and the common
-//     non-transactional statements like `VACUUM` / `CREATE DATABASE`);
-//     authors must still avoid any other non-transactional statement, as
-//     a half-applied file would leave a schema the restore cannot place.
-//
-// Sources first-installed by this run are returned to NilVersion if they
-// carry a dirty marker (their up-only `001` floor is idempotent and
-// re-applies on a re-run) and otherwise left at their freshly-applied
-// floor; their floor cannot be reversed. A source found already dirty at
-// entry is not migrated at all: RunUp restores the prior sources and
-// surfaces the dirty source for operator `force` resolution, since its
-// true schema state is ambiguous.
+// Sources first-installed this run are reset to NilVersion if they carry
+// a dirty marker (their idempotent floor re-applies on a re-run) and
+// otherwise left at their freshly-applied version. A source found already
+// dirty at entry is not migrated: RunUp restores the prior sources and
+// surfaces it for operator `force`, since its true state is ambiguous.
 func RunUp(ctx context.Context, dsn string, sources []Source) error {
 	globalDB, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -337,7 +326,7 @@ func preRunVersion(ctx context.Context, dsn, schema string) (version uint, dirty
 	)
 	// go-migrate keeps a single bookkeeping row (version, dirty).
 	switch err := db.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT version, dirty FROM %s.schema_migrations LIMIT 1", schema)).Scan(&v, &d); {
+		fmt.Sprintf("SELECT version, dirty FROM %s.schema_migrations LIMIT 1", pgx.Identifier{schema}.Sanitize())).Scan(&v, &d); {
 	case errors.Is(err, sql.ErrNoRows):
 		return 0, false, false, nil
 	case err != nil:
@@ -482,7 +471,7 @@ func schemaMigrationsRowCount(ctx context.Context, db *sql.DB, schema string) (i
 		return 0, nil
 	}
 	var count int
-	q := fmt.Sprintf("SELECT count(*) FROM %s.schema_migrations", schema)
+	q := fmt.Sprintf("SELECT count(*) FROM %s.schema_migrations", pgx.Identifier{schema}.Sanitize())
 	if err := db.QueryRowContext(ctx, q).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count schema_migrations rows: %w", err)
 	}

@@ -66,30 +66,18 @@ of server startup. Reads ` + dbURLEnv + ` from the environment when
 	return cmd
 }
 
-// EnableSourceSelection wires the `--source` persistent flag onto
-// the `migrate` parent command. Intended for downstream binaries
-// that register more than one migration source via Register —
-// single-source binaries leave the flag off and let resolveSource
-// infer the sole source.
+// EnableSourceSelection wires the `--source` persistent flag onto the
+// `migrate` parent command, for downstream binaries that register more
+// than one source. Single-source binaries leave it off and let
+// resolveSource infer the sole source.
 //
-// Behavior with the flag wired:
-//   - `up` and `status` reject --source as "not applicable" (they
-//     aggregate across every registered source).
-//   - `down`, `goto`, `force` require --source when more than one
-//     source is registered; --source is otherwise inferred to the
-//     sole registered source.
-//   - `version` accepts --source as a filter; without it, prints
-//     one line per registered source.
+// With the flag wired: `up`/`status` reject --source (they aggregate
+// across all sources); `down`/`goto`/`force` require it when more than
+// one source is registered (else infer the sole one); `version` takes
+// it as an optional filter.
 //
-// Must be called AFTER NewCommand has constructed the parent (the
-// function panics otherwise) and AFTER all Register calls have run
-// — practically, near the end of the downstream binary's `init()`
-// or early in its main(), once both the OSS and downstream sources
-// have registered themselves.
-//
-// Idempotent: repeat calls after the flag is already wired no-op.
-// Tests and downstream init() that may run more than once in the
-// same process are safe.
+// Call after NewCommand (panics otherwise) and after all Register calls.
+// Idempotent: a repeat call once the flag is wired is a no-op.
 func EnableSourceSelection() {
 	if migrateCmd == nil {
 		panic("migrate.EnableSourceSelection: called before NewCommand")
@@ -173,13 +161,9 @@ func withSourceMigrator(ctx context.Context, src Source, dsn string, fn func(mg 
 	})
 }
 
-// readVersion returns the highest applied version for mg and whether
-// the schema_migrations row is dirty (mid-failed-migration). Callers
-// that don't need the dirty flag pass _ — but every display path
-// should surface it, since a dirty schema is a real operator signal
-// go-migrate gives us for free.
-//
-// ErrNilVersion (nothing applied) is normalized to (0, false, nil).
+// readVersion returns mg's highest applied version and whether the
+// schema_migrations row is dirty (mid-failed-migration). ErrNilVersion
+// (nothing applied) is normalized to (0, false, nil).
 func readVersion(mg *migrate.Migrate) (uint, bool, error) {
 	v, dirty, err := mg.Version()
 	if err != nil {
@@ -263,12 +247,8 @@ on the per-source subcommands (down/goto/force).`,
 			}
 
 			ctx := cmd.Context()
-			// Pre-snapshot pending counts across all sources so we
-			// can report "applied N migration(s)" after orchestrator
-			// success. The snapshot reads version + counts files;
-			// gaps in the file sequence (e.g. a deleted v5) are
-			// handled by the same `sourceFileVersions` primitive used
-			// by `status`.
+			// Snapshot pending counts before the run so we can report
+			// "applied N migration(s)" after the orchestrator succeeds.
 			prePending := 0
 			for _, src := range srcs {
 				p, err := pendingCount(ctx, src, dsn)
@@ -346,13 +326,9 @@ the version named in the failure message.`,
 				return err
 			}
 			return withSourceMigrator(cmd.Context(), src, dsn, func(mg *migrate.Migrate) error {
-				// Pre-read is defensive: if it fails (preV=0), the
-				// post-rollback math still works because
-				// countVersionsBetween treats the case as
-				// "from 0 to postV" — i.e. nothing rolled back from
-				// preV's perspective. The post-read error MUST surface
-				// or a transient DB failure would corrupt the count
-				// display.
+				// Pre-read failure is tolerated (preV=0 still yields a
+				// sane count); the post-read error must surface, or a
+				// transient failure would misreport the rolled-back count.
 				preV, _, _ := readVersion(mg)
 				if err := mg.Steps(-n); err != nil {
 					if errors.Is(err, migrate.ErrNoChange) {
@@ -380,9 +356,8 @@ func newStatusCmd() *cobra.Command {
 		Short: "Show how many migrations are applied vs pending across all sources",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			// Dead in OSS-only — flag is unregistered, value stays ""
-			// — but live once EnableSourceSelection wires --source for
-			// a downstream multi-source build. See newUpCmd.
+			// Unreachable until EnableSourceSelection wires --source for
+			// a multi-source build (see newUpCmd).
 			if flags.source != "" {
 				return errors.New("status aggregates across all registered sources; --source is not applicable")
 			}
@@ -400,11 +375,9 @@ func newStatusCmd() *cobra.Command {
 
 			lines := make([]lineRow, 0, len(srcs))
 			appliedTotal, pendingTotal := 0, 0
-			// Multi-source binaries surface a per-source desync line
-			// on stdout (see the breakdown loop below). Single-source
-			// binaries don't print that breakdown, so the stderr
-			// warning is their only signal — emit only when there's
-			// no stdout breakdown that would carry it.
+			// Single-source builds print no per-source breakdown, so the
+			// stderr desync warning below is gated to them as their only
+			// signal; multi-source builds carry it in the stdout breakdown.
 			multiSource := len(srcs) > 1
 			for _, src := range srcs {
 				versions, err := sourceFileVersions(src)
@@ -424,21 +397,17 @@ func newStatusCmd() *cobra.Command {
 					}
 					dbVersion = int(v)
 					dirty = d
-					// applied counts files whose version is ≤ dbVersion;
-					// pending counts the rest. This survives gaps in
-					// the version sequence (e.g. a deleted v5) where
-					// `count(files)` and `max(version)` diverge.
+					// Count files at/below the DB version as applied
+					// (counting by version, not file count, survives gaps
+					// like a deleted v5).
 					for _, fv := range versions {
 						if fv <= dbVersion {
 							applied++
 						}
 					}
 					if dbVersion > maxFileVersion {
-						// Binary's highest shipped version is below the
-						// DB's recorded version — operator is running an
-						// older arctl against a DB migrated by a newer
-						// build. Warn but don't fail; the operator
-						// should reconcile by upgrading the binary.
+						// Older binary against a DB migrated by a newer
+						// build. Warn, don't fail.
 						downgraded = true
 						if !multiSource {
 							fmt.Fprintf(os.Stderr,
@@ -462,13 +431,12 @@ func newStatusCmd() *cobra.Command {
 			}
 			if multiSource {
 				fmt.Fprintf(out, "%d migration(s) applied, %d pending\n", appliedTotal, pendingTotal)
-				// Same `multiSource` used to gate the stderr desync
-				// warning above — both signals live and die together so
-				// future "skip-this-source" branches can't desync them.
+				// Reuses the same `multiSource` gate as the stderr desync
+				// warning above on purpose: a per-source skip branch must
+				// not let the two diverge (a desync gets a source warned
+				// twice or not at all).
 				for _, l := range lines {
 					if l.downgraded {
-						// "db reports v" carries the version; no
-						// redundant "at v" needed.
 						fmt.Fprintf(out, "  %s: %d applied, %d pending (db reports v%d%s — binary out of date)\n",
 							l.src.Name, l.applied, l.pending, l.dbVersion, dirtyTag(l.dirty))
 					} else {
@@ -477,12 +445,9 @@ func newStatusCmd() *cobra.Command {
 					}
 				}
 			} else {
-				// Single-source: fold the version into the headline
-				// line so operators don't have to run `version`
-				// separately. dbVersion is the raw schema_migrations
-				// value (matches `force V` semantics); applied is the
-				// count capped at the file count, surfacing a desync
-				// when those numbers differ.
+				// Single-source: fold the version into the headline so
+				// operators needn't run `version` separately. dbVersion is
+				// the raw schema_migrations value (matches `force V`).
 				l := lines[0]
 				fmt.Fprintf(out, "%d migration(s) applied (at v%d%s), %d pending\n",
 					l.applied, l.dbVersion, dirtyTag(l.dirty), l.pending)
@@ -496,19 +461,17 @@ func newStatusCmd() *cobra.Command {
 }
 
 // statusJSON is the wire format for `arctl db migrate status -o json`.
-// Stable contract — operators may consume it from CI/CD shell scripts
-// via `jq`. Field names and types are part of the CLI's documented
-// surface; do not rename or retype (e.g. int → int64, string → number)
-// without a CLI major version bump and a deprecation cycle.
+// Operators consume it via `jq`, so the field names and types are a
+// frozen contract; TestStatusJSONShape locks them and fails CI on a
+// rename or retype.
 type statusJSON struct {
 	Applied int                `json:"applied"`
 	Pending int                `json:"pending"`
 	Sources []statusSourceJSON `json:"sources"`
 }
 
-// statusSourceJSON is the per-source object inside statusJSON. Same
-// stability contract as statusJSON — field names and types are
-// frozen at the current CLI major version.
+// statusSourceJSON is the per-source object inside statusJSON; same
+// frozen-shape contract, also locked by TestStatusJSONShape.
 type statusSourceJSON struct {
 	Name       string `json:"name"`
 	Applied    int    `json:"applied"`
