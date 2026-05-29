@@ -24,9 +24,12 @@ through `search_path`. Authors:
 - Do **not** include `SET search_path` — the driver sets it.
 - Cross-schema references in migrations are not allowed.
 
-`pkg/registry/v1alpha1store/migrations_lint_test.go` walks the embed
-on every `go test ./...` and rejects any of those patterns with a
-`filename:line` pointer.
+The rule catalogue and lint engine live in the shared
+`pkg/registry/database/migrationlint` package. `migrationlint.Check(fs,
+dir)` walks an embedded migration set and returns one violation per
+rejected line (`filename:line` pointer). The OSS set runs it on every
+`go test ./...` via `migrations_lint_test.go`; downstream migration sets
+run the same `Check` against their own embed (see the package doc).
 
 ### Invariant: unqualified DDL ↔ `search_path` set on the connection
 
@@ -151,9 +154,10 @@ unless an operator invokes `arctl db migrate down` or a backward
 
 ## Testing
 
-The lint test runs in every `go test ./...` and is the first gate any
-new migration must pass. Schema-and-data integration coverage lives
-under `pkg/registry/database/integration/` with `//go:build integration`.
+The lint (`migrationlint.Check`) runs in every `go test ./...` and is the
+first gate any new migration must pass. Schema-and-data integration
+coverage lives under `pkg/registry/database/integration/` with
+`//go:build integration`.
 
 ## Downgrade is not supported once the bridge has fired
 
