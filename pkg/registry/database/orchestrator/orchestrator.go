@@ -129,9 +129,12 @@ const orchestratorGlobalLockKey int64 = 0x6172_6f72_6368_6573 // "arorches"
 //     (see migrations/README.md), and
 //   - each migration file is applied as one implicit transaction, so a
 //     failed migration's DDL rolls back atomically and only a dirty
-//     bookkeeping marker is left behind — never half-applied schema (the
-//     lint test forbids `CONCURRENTLY` and explicit transaction control,
-//     which are the only ways to break that).
+//     bookkeeping marker is left behind — never half-applied schema. The
+//     lint test rejects the constructs most likely to break that
+//     (`CONCURRENTLY`, explicit transaction control, and the common
+//     non-transactional statements like `VACUUM` / `CREATE DATABASE`);
+//     authors must still avoid any other non-transactional statement, as
+//     a half-applied file would leave a schema the restore cannot place.
 //
 // Sources first-installed by this run are returned to NilVersion if they
 // carry a dirty marker (their up-only `001` floor is idempotent and
@@ -235,9 +238,14 @@ func restoreAll(ctx context.Context, dsn string, sources []appliedSource) error 
 //     commits the dirty flag before running a migration body that then
 //     rolled back atomically) is force-cleared first so Migrate can run.
 //   - A source first-installed this run (present == false) is reset to
-//     NilVersion if it still carries a marker — its up-only `001` floor is
-//     idempotent and re-applies on a re-run — and otherwise left at its
-//     freshly-applied floor. Its floor tables are left in place.
+//     NilVersion if it still carries a marker, and otherwise left at its
+//     freshly-applied version. Its tables are left in place: the up-only
+//     `001` floor cannot be reversed, and any migrations that committed
+//     before the failure (002+) are left applied too — all of them are
+//     idempotent, so a re-run replays from NilVersion and converges. For
+//     a freshly-installed source the prior release's combo is "absent",
+//     and the leftover tables are harmless to a prior binary that does
+//     not know the source.
 //   - An upgraded source (present == true) is migrated back down to its
 //     entry version, running only the `.down.sql` files for the
 //     incremental migrations — never the up-only floor (entry >= 1).
@@ -280,7 +288,8 @@ func restoreSource(ctx context.Context, dsn string, a appliedSource) error {
 		// single-transaction invariant in migrations/README.md), so cur's
 		// DDL is not present. Force the marker clean at cur so Migrate can
 		// run; the down to the entry version reverses the migrations that
-		// did commit this run.
+		// did commit this run. cur is a migration version (bounded by the
+		// source's migration count), so the uint->int narrow is safe.
 		if err := mg.Force(int(cur)); err != nil {
 			return fmt.Errorf("clear dirty marker for source %s at v%d: %w", a.src.Name, cur, err)
 		}

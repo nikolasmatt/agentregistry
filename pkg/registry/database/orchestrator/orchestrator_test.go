@@ -436,7 +436,10 @@ func TestRunUp_RestoresUpgradedFailingSourceToEntry(t *testing.T) {
 		"m/002_add.up.sql":    {Data: []byte("CREATE TABLE IF NOT EXISTS c_t2 (id int);")},
 		"m/002_add.down.sql":  {Data: []byte("DROP TABLE IF EXISTS c_t2;")},
 		"m/003_bad.up.sql":    {Data: []byte("SELECT 1/0;")},
-		"m/003_bad.down.sql":  {Data: []byte("SELECT 1;")},
+		// 003's down is replayed during the restore even though 003's up
+		// never committed (go-migrate runs every down between cur and the
+		// target), so it must be a harmless no-op.
+		"m/003_bad.down.sql": {Data: []byte("SELECT 1;")},
 	}
 
 	require.NoError(t, orchestrator.RunUp(ctx, dsn,
@@ -466,6 +469,69 @@ func TestRunUp_RestoresUpgradedFailingSourceToEntry(t *testing.T) {
 	require.NoError(t, db.QueryRowContext(ctx,
 		"SELECT to_regclass('track_c.c_t') IS NOT NULL").Scan(&hasC1))
 	require.True(t, hasC1, "the entry-version floor must remain")
+}
+
+// TestRunUp_RestoresFreshInstallWithIntermediateCommit covers a
+// first-installed source whose floor and an intermediate migration commit
+// before a later one fails. The marker must be reset to nil (so a re-run
+// isn't blocked) and the idempotent leftover tables let the re-run
+// converge. The source is fresh, so there is no prior-release version to
+// return to — only the dirty marker must be cleared.
+func TestRunUp_RestoresFreshInstallWithIntermediateCommit(t *testing.T) {
+	dsn := newDB(t)
+	ctx := context.Background()
+
+	// track_e is installed fresh this run: 001 + 002 commit, 003 fails.
+	files := fstest.MapFS{
+		"m/001_init.up.sql":   {Data: []byte("CREATE TABLE IF NOT EXISTS e_t (id int);")},
+		"m/001_init.down.sql": {Data: []byte("DO $$ BEGIN RAISE EXCEPTION 'up-only'; END $$;")},
+		"m/002_add.up.sql":    {Data: []byte("CREATE TABLE IF NOT EXISTS e_t2 (id int);")},
+		"m/002_add.down.sql":  {Data: []byte("DROP TABLE IF EXISTS e_t2;")},
+		"m/003_bad.up.sql":    {Data: []byte("SELECT 1/0;")},
+		// The restore clears the dirty marker at 003 then migrates down to
+		// nil, so go-migrate replays 003's down even though 003's up never
+		// committed — a harmless no-op here, which is why it's `SELECT 1;`.
+		"m/003_bad.down.sql": {Data: []byte("SELECT 1;")},
+	}
+	src := orchestrator.Source{Name: "track_e", Schema: "track_e", Files: files, Dir: "m"}
+
+	err := orchestrator.RunUp(ctx, dsn, []orchestrator.Source{src})
+	require.Error(t, err)
+
+	db, e := sql.Open("pgx", dsn)
+	require.NoError(t, e)
+	defer func() { _ = db.Close() }()
+
+	// Marker reset to nil — no dirty row blocks a re-run.
+	var rows int
+	require.NoError(t, db.QueryRowContext(ctx,
+		"SELECT count(*) FROM track_e.schema_migrations").Scan(&rows))
+	require.Equal(t, 0, rows, "freshly-installed failing source must be reset to nil")
+
+	// The committed-before-failure tables are left in place (idempotent on re-run).
+	for _, tbl := range []string{"track_e.e_t", "track_e.e_t2"} {
+		var present bool
+		require.NoError(t, db.QueryRowContext(ctx,
+			"SELECT to_regclass($1) IS NOT NULL", tbl).Scan(&present))
+		require.True(t, present, "%s committed before the failure and is left in place", tbl)
+	}
+
+	// A re-run with the 003 failure removed converges cleanly from nil.
+	fixed := fstest.MapFS{
+		"m/001_init.up.sql":   {Data: []byte("CREATE TABLE IF NOT EXISTS e_t (id int);")},
+		"m/001_init.down.sql": {Data: []byte("DO $$ BEGIN RAISE EXCEPTION 'up-only'; END $$;")},
+		"m/002_add.up.sql":    {Data: []byte("CREATE TABLE IF NOT EXISTS e_t2 (id int);")},
+		"m/002_add.down.sql":  {Data: []byte("DROP TABLE IF EXISTS e_t2;")},
+		"m/003_ok.up.sql":     {Data: []byte("CREATE TABLE IF NOT EXISTS e_t3 (id int);")},
+		"m/003_ok.down.sql":   {Data: []byte("DROP TABLE IF EXISTS e_t3;")},
+	}
+	require.NoError(t, orchestrator.RunUp(ctx, dsn,
+		[]orchestrator.Source{{Name: "track_e", Schema: "track_e", Files: fixed, Dir: "m"}}))
+
+	var version int
+	require.NoError(t, db.QueryRowContext(ctx,
+		"SELECT version FROM track_e.schema_migrations LIMIT 1").Scan(&version))
+	require.Equal(t, 3, version, "re-run converges from nil to the latest version")
 }
 
 // TestRunUp_RefusesSourceAlreadyDirty asserts a source found dirty at the

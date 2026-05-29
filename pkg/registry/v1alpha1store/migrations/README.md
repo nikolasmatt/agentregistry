@@ -65,15 +65,17 @@ NNN_short_name.down.sql      # reverse (required by the iofs source)
 ## Forward migrations
 
 `NNN_short_name.up.sql` is the schema change. **Do not add explicit
-`BEGIN;` / `COMMIT;` / `START TRANSACTION`, and do not use
-`CONCURRENTLY`** (the lint test rejects both). The driver sends the
-whole file to Postgres in one `Exec` over the simple query protocol,
-which runs it as a **single implicit transaction**: every statement in
-the file commits together, or — if any statement fails — they all roll
-back together. Postgres DDL is transactional, so a failed migration
-leaves no half-applied schema. Adding explicit transaction control or a
-`CONCURRENTLY` statement breaks that single-transaction guarantee,
-which is why they are linted out (see "Atomicity invariant" below).
+`BEGIN;` / `COMMIT;` / `START TRANSACTION`, do not use `CONCURRENTLY`,
+and do not use a statement Postgres refuses to run inside a transaction
+block** (`VACUUM`, `CREATE DATABASE`, `ALTER SYSTEM`, …). The driver
+sends the whole file to Postgres in one `Exec` over the simple query
+protocol, which runs it as a **single implicit transaction**: every
+statement in the file commits together, or — if any statement fails —
+they all roll back together. Postgres DDL is transactional, so a failed
+migration leaves no half-applied schema. Any of the constructs above
+breaks that single-transaction guarantee. The lint test rejects the
+common ones (see "Atomicity invariant" below); it is not exhaustive, so
+avoid non-transactional statements generally even if the lint is silent.
 
 Even though the DDL rolls back, a failed migration leaves go-migrate's
 `schema_migrations` row marked **dirty**: go-migrate commits the
@@ -111,12 +113,15 @@ That restore is only safe because of the single-transaction property
 above: a failed migration's DDL has fully rolled back, so clearing the
 marker and replaying downs lands the schema exactly at the entry
 version. **A migration that breaks atomicity — explicit transaction
-control, or `CONCURRENTLY` — could leave half-applied DDL that the
-restore would then mismatch, silently corrupting the schema.** This is
-why the lint test rejects those constructs; the rejection is not
-stylistic. A source found *already* dirty at the start of a run is not
-restored at all — its true state is ambiguous, so `RunUp` surfaces it
-for `arctl db migrate force` instead of guessing.
+control, `CONCURRENTLY`, or any other statement that cannot run inside a
+transaction block — could leave half-applied DDL that the restore would
+then mismatch, silently corrupting the schema.** This is why the lint
+test rejects those constructs; the rejection is not stylistic. The lint
+catalogue is not exhaustive, so the invariant is ultimately the author's
+to uphold: never write a non-transactional statement in a migration. A
+source found *already* dirty at the start of a run is not restored at
+all — its true state is ambiguous, so `RunUp` surfaces it for `arctl db
+migrate force` instead of guessing.
 
 ## Reverse migrations
 

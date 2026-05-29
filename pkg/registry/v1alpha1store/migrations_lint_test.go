@@ -163,6 +163,18 @@ var forbiddenPatterns = []struct {
 		re:      regexp.MustCompile(`(?i)(?:\bSTART\s+TRANSACTION\b|\bBEGIN\s+TRANSACTION\b|\bBEGIN\s+WORK\b|\bBEGIN\s*;)`),
 		message: "explicit transaction control (BEGIN/START TRANSACTION) is not allowed (the driver wraps each migration file in one implicit transaction)",
 	},
+	{
+		// Statements Postgres refuses to run inside a transaction block.
+		// In a multi-statement file they fail loudly ("cannot run inside a
+		// transaction block"); alone they apply non-atomically. Either way
+		// they break the single-transaction guarantee the orchestrator's
+		// failure-restore relies on, so reject them at lint time rather
+		// than apply time. This is not exhaustive — any other
+		// non-transactional statement is equally unsafe — but it catches
+		// the ones most likely to be written.
+		re:      regexp.MustCompile(`(?i)(?:\bVACUUM\b|\b(?:CREATE|DROP)\s+(?:DATABASE|TABLESPACE)\b|\bALTER\s+SYSTEM\b)`),
+		message: "non-transactional statement (VACUUM / CREATE|DROP DATABASE|TABLESPACE / ALTER SYSTEM) is not allowed (it cannot run inside the single transaction the driver wraps each migration file in)",
+	},
 }
 
 // scanSQL applies the forbidden-pattern catalogue to a single file.
@@ -176,6 +188,10 @@ func scanSQL(path string, data []byte) []string {
 		lineNum++
 		line := scanner.Text()
 		// Strip SQL line comments so commentary doesn't flag the lint.
+		// String literals are NOT stripped, so a forbidden keyword inside
+		// a string (e.g. 'ALTER SYSTEM disabled') would false-positive.
+		// Accepted: migrations don't carry such literals, and a false
+		// positive fails safe (rejects a migration that would have applied).
 		if idx := strings.Index(line, "--"); idx >= 0 {
 			line = line[:idx]
 		}
@@ -315,6 +331,21 @@ func TestMigrationsLint_FlagsForbiddenPatterns(t *testing.T) {
 			"explicit START TRANSACTION",
 			"START TRANSACTION;\nCREATE TABLE foo (id int);",
 			"explicit transaction control",
+		},
+		{
+			"VACUUM",
+			"VACUUM ANALYZE foo;",
+			"non-transactional statement",
+		},
+		{
+			"CREATE DATABASE",
+			"CREATE DATABASE foo;",
+			"non-transactional statement",
+		},
+		{
+			"ALTER SYSTEM",
+			"ALTER SYSTEM SET work_mem = '64MB';",
+			"non-transactional statement",
 		},
 	}
 	for _, tc := range cases {
