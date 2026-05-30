@@ -37,6 +37,30 @@ func OSSSource() orchestrator.Source {
 	}
 }
 
+// Pre-redesign migrations were recorded in a shared public.schema_migrations
+// table partitioned by a per-source version offset, so multiple tracks could
+// coexist. OSS migrations carry offset 200 (migration N recorded as 200+N);
+// other registered tracks use higher offsets, keeping their versions above
+// the OSS range.
+const (
+	// legacyOSSVersionOffset is the offset added to OSS migration versions in
+	// the legacy public.schema_migrations table (migration N is recorded as
+	// 200+N). The version probe bounds between this offset and the floor, so
+	// higher-numbered rows owned by downstream/extension tracks stay out of the
+	// result without encoding their numbering here.
+	legacyOSSVersionOffset = 200
+
+	// legacyOSSVersionFloor is the offset version of the last OSS migration
+	// shipped before the migration redesign — migration 008, recorded as 208.
+	// The frozen column lists below describe the v1alpha1 schema as of this
+	// version, so a database that stopped short of it cannot be bridged safely:
+	// the copy would reference a column the source lacks (aborting the upgrade)
+	// or skip data a later pre-redesign migration would have added. Such
+	// databases are rejected and must finish applying the pre-redesign
+	// migrations first.
+	legacyOSSVersionFloor = legacyOSSVersionOffset + 8
+)
+
 // ossTables is the set of legacy OSS data tables the copy covers,
 // in dependency order (none reference another via FK today, but the
 // order is stable for log readability and future-proofing). Column
@@ -116,6 +140,21 @@ var ossTableColumns = map[string][]string{
 // Legacy `v1alpha1.*` tables are not dropped — a follow-up regular
 // go-migrate migration handles that.
 func RunOSS(ctx context.Context, db *sql.DB, schema database.Schema) error {
+	// Reject a partially-migrated OSS track up front rather than abort
+	// mid-copy; see legacyOSSVersionFloor for why the column lists below
+	// require the full pre-redesign sequence.
+	legacyVer, hasLegacyOSS, err := legacyOSSVersion(ctx, db)
+	if err != nil {
+		return fmt.Errorf("probe legacy OSS migration version: %w", err)
+	}
+	if hasLegacyOSS && legacyVer < legacyOSSVersionFloor {
+		return fmt.Errorf(
+			"OSS database is at migration v%d but the migration redesign requires the last "+
+				"release before it (through migration v%d); finish applying the pre-redesign "+
+				"migrations first, then re-run the upgrade",
+			legacyVer-legacyOSSVersionOffset, legacyOSSVersionFloor-legacyOSSVersionOffset)
+	}
+
 	exists, err := legacyAgentsExists(ctx, db)
 	if err != nil {
 		return fmt.Errorf("probe v1alpha1.agents: %w", err)
@@ -185,6 +224,33 @@ func quotedColumnList(cols []string) string {
 		quoted[i] = pgx.Identifier{c}.Sanitize()
 	}
 	return strings.Join(quoted, ", ")
+}
+
+// legacyOSSVersion returns the highest OSS migration version recorded in the
+// prior custom migrator's public.schema_migrations table, bounded to the OSS
+// track's own version space (legacyOSSVersionOffset, legacyOSSVersionFloor] so
+// higher-numbered rows owned by downstream/extension sources don't mask a short
+// OSS upgrade, and whether any OSS migration was recorded at all. A missing
+// table — or a table with only downstream-track rows — reports (0, false).
+func legacyOSSVersion(ctx context.Context, db *sql.DB) (version int, present bool, err error) {
+	var oid sql.NullString
+	if err := db.QueryRowContext(ctx,
+		"SELECT to_regclass('public.schema_migrations')::text").Scan(&oid); err != nil {
+		return 0, false, err
+	}
+	if !oid.Valid {
+		return 0, false, nil
+	}
+	var maxVersion sql.NullInt64
+	if err := db.QueryRowContext(ctx,
+		"SELECT MAX(version) FROM public.schema_migrations WHERE version > $1 AND version <= $2",
+		legacyOSSVersionOffset, legacyOSSVersionFloor).Scan(&maxVersion); err != nil {
+		return 0, false, fmt.Errorf("read legacy OSS migration version: %w", err)
+	}
+	if !maxVersion.Valid {
+		return 0, false, nil
+	}
+	return int(maxVersion.Int64), true, nil
 }
 
 // legacyAgentsExists probes for the canonical `v1alpha1.agents` table
