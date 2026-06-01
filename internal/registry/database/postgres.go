@@ -71,10 +71,9 @@ func NewPostgreSQL(ctx context.Context, connectionURI string, authz auth.Authori
 	}
 
 	if skipMigrations {
-		// The gate can fire from AppOptions.SkipMigrations,
-		// AGENT_REGISTRY_SKIP_MIGRATIONS, or the bare SKIP_MIGRATIONS
-		// env — phrase neutrally so operators searching for any of
-		// the three see the line. Echo the schema name so operators
+		// The gate can fire from AppOptions.SkipMigrations or the
+		// SKIP_MIGRATIONS env — phrase neutrally so operators searching
+		// for either see the line. Echo the schema name so operators
 		// can see what search_path the pool is talking to without
 		// reading the binary's source.
 		slog.Info("skipping startup migrations (SkipMigrations enabled) — schema must already be applied",

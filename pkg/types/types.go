@@ -199,8 +199,7 @@ type AppOptions struct {
 	// automatically skipped — downstream factories that run their own
 	// migrations should consult this same flag (e.g. via closure
 	// capture from AppOptions construction) to honor the operator's
-	// intent. Wins over the AGENT_REGISTRY_SKIP_MIGRATIONS /
-	// SKIP_MIGRATIONS env fallback when set true.
+	// intent. Wins over the SKIP_MIGRATIONS env var when set true.
 	SkipMigrations bool
 
 	// RuntimeAdapters registers per-type PostUpsert/PostDelete

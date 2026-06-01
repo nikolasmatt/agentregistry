@@ -36,11 +36,12 @@ type Config struct {
 	// SkipMigrations gates the server's Postgres migrator at startup.
 	// Set true when migrations are applied out-of-band (e.g. by
 	// `arctl db migrate up` from CI/CD ahead of the rollout).
-	// Populated from AGENT_REGISTRY_SKIP_MIGRATIONS or the unprefixed
-	// SKIP_MIGRATIONS as a fallback (prefixed wins; see NewConfig).
+	// Populated from the unprefixed SKIP_MIGRATIONS env var (see
+	// NewConfig) — deliberately prefix-free so the same name toggles
+	// the gate across binaries regardless of their env prefix.
 	// AppOptions.SkipMigrations wins over this env value when set
 	// programmatically.
-	SkipMigrations bool `env:"SKIP_MIGRATIONS" envDefault:"false"`
+	SkipMigrations bool `env:"-"`
 }
 
 // NewConfig creates a new configuration with default values.
@@ -48,7 +49,7 @@ type Config struct {
 // Server-only entry point: NewConfig is called from registry.App() at
 // server start; arctl does not call NewConfig, so the os.Exit(1)
 // branches below (caarlos0/env parse failure and the SKIP_MIGRATIONS
-// fallback parse) cannot fire during CLI invocations like `arctl db
+// parse) cannot fire during CLI invocations like `arctl db
 // migrate`.
 func NewConfig() *Config {
 	var cfg Config
@@ -60,26 +61,18 @@ func NewConfig() *Config {
 		os.Exit(1)
 	}
 
-	// SkipMigrations also accepts the unprefixed SKIP_MIGRATIONS so
-	// operators (and downstream binaries with a different env prefix)
-	// can toggle the gate without the AGENT_REGISTRY_ prefix.
-	// AGENT_REGISTRY_SKIP_MIGRATIONS wins when both are set.
-	//
-	// Symmetry: the prefixed env is parsed by caarlos0/env above, which
-	// errors and triggers the os.Exit(1) on invalid bool values. The
-	// bare-env path below mirrors that contract — an invalid value
-	// fails NewConfig the same way rather than silently falling back to
-	// false — so operators get the same loud feedback no matter which
-	// name they used.
-	if _, prefixed := os.LookupEnv("AGENT_REGISTRY_SKIP_MIGRATIONS"); !prefixed {
-		if raw, ok := os.LookupEnv("SKIP_MIGRATIONS"); ok {
-			parsed, perr := strconv.ParseBool(raw)
-			if perr != nil {
-				slog.Error("failed to parse SKIP_MIGRATIONS", "value", raw, "error", perr)
-				os.Exit(1)
-			}
-			cfg.SkipMigrations = parsed
+	// SkipMigrations reads the unprefixed SKIP_MIGRATIONS rather than the
+	// AGENT_REGISTRY_ prefix the other fields use, so the same env var
+	// toggles the gate across binaries regardless of their prefix. An
+	// invalid value fails NewConfig loudly (mirroring caarlos0/env above)
+	// rather than silently falling back to false.
+	if raw, ok := os.LookupEnv("SKIP_MIGRATIONS"); ok {
+		parsed, perr := strconv.ParseBool(raw)
+		if perr != nil {
+			slog.Error("failed to parse SKIP_MIGRATIONS", "value", raw, "error", perr)
+			os.Exit(1)
 		}
+		cfg.SkipMigrations = parsed
 	}
 
 	// Append a random suffix to RuntimeDir when the user has not set an

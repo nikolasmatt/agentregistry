@@ -76,7 +76,7 @@ func App(ctx context.Context, opts ...types.AppOptions) error {
 	authz := auth.Authorizer{Authz: authzProvider}
 
 	// Effective SkipMigrations: AppOptions wins when set, otherwise the
-	// env-driven Config value (AGENT_REGISTRY_SKIP_MIGRATIONS) applies.
+	// env-driven Config value (SKIP_MIGRATIONS) applies.
 	// Either may be true; both being false means run the migrator.
 	skipMigrations := options.SkipMigrations || cfg.SkipMigrations
 
